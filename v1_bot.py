@@ -671,6 +671,7 @@ async def process_wholesale_price(message: Message, state: FSMContext):
             return
         await state.update_data(wholesale_price=wholesale_price)
         await message.answer("Введите расположение склада:\n\n❌ Для отмены введите /cancel")
+        await state.set_state(AddStock.waiting_for_warehouse)
     except ValueError:
         await message.answer("Пожалуйста, введите корректное число для цены:\n\n❌ Для отмены введите /cancel")
 
@@ -686,7 +687,6 @@ async def process_warehouse(message: Message, state: FSMContext):
         
     try:
         user_data = await state.get_data()
-        await state.clear()
         
         user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
         
@@ -720,8 +720,9 @@ async def process_warehouse(message: Message, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Add stock error: {e}")
-        await state.clear()
-        await message.answer("❌ Произошла ошибка при добавлении товара. Попробуйте снова.")
+        await message.answer(f"❌ Произошла ошибка при добавлении товара: {str(e)}")
+    
+    await state.clear()
 
 @dp.message(Command("mystock"))
 async def cmd_mystock(message: Message):
@@ -917,7 +918,7 @@ async def process_delete_sku(message: Message, state: FSMContext):
         f"🏭 Бренд: {item[5]}\n"
         f"📊 Количество: {item[7]}\n\n"
         f"Вы уверены, что хотите удалить этот товар?\n\n"
-        "❌ Для отмены введите /cancel",
+        "❌ Для отмена введите /cancel",
         reply_markup=get_confirmation_keyboard()
     )
     await state.set_state(DeleteItem.confirmation)
