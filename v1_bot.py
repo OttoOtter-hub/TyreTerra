@@ -426,289 +426,6 @@ def get_confirmation_keyboard():
         resize_keyboard=True
     )
 
-# =============================================================================
-# СИСТЕМА ПОИСКА
-# =============================================================================
-
-def get_search_keyboard():
-    """Клавиатура выбора типа поиска"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Умный поиск"), KeyboardButton(text="📦 Все товары")],
-            [KeyboardButton(text="🎯 Комбинированный поиск"), KeyboardButton(text="❌ Отмена")]
-        ],
-        resize_keyboard=True
-    )
-
-@dp.message(F.text == "🔍 Поиск")
-@dp.message(Command("search"))
-async def cmd_search(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user = await db.fetchone("SELECT role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    await message.answer(
-        "🔍 <b>Поиск товаров</b>\n\n"
-        "Выберите тип поиска:\n\n"
-        "• <b>🔍 Умный поиск</b> - поиск по SKU, размеру, модели или бренду\n"
-        "• <b>📦 Все товары</b> - выгрузка всех товаров всех дилеров\n"
-        "• <b>🎯 Комбинированный поиск</b> - расширенный поиск по нескольким параметрам\n\n"
-        "💡 <i>Для покупателей показываются только розничные цены</i>",
-        reply_markup=get_search_keyboard()
-    )
-    await state.set_state(SearchStock.waiting_for_search_type)
-
-@dp.message(SearchStock.waiting_for_search_type)
-async def process_search_type(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == "❌ Отмена":
-        await cancel_handler(message, state)
-        return
-        
-    if message.text == "📦 Все товары":
-        await execute_all_stock_search(message, state)
-        return
-        
-    if message.text == "🔍 Умный поиск":
-        await message.answer(
-            "🔍 <b>Умный поиск товаров</b>\n\n"
-            "Введите SKU, типоразмер, модель или бренд для поиска:\n\n"
-            "💡 <i>Система найдет товары по любому из этих параметров</i>",
-            reply_markup=get_cancel_keyboard()
-        )
-        await state.set_state(SearchStock.waiting_for_search_value)
-    elif message.text == "🎯 Комбинированный поиск":
-        await message.answer(
-            "🎯 <b>Комбинированный поиск</b>\n\n"
-            "Эта функция в разработке...\n\n"
-            "В будущем здесь будет расширенный поиск по нескольким параметрам одновременно.",
-            reply_markup=get_search_keyboard()
-        )
-    else:
-        await message.answer("Пожалуйста, выберите тип поиска из предложенных вариантов:")
-
-@dp.message(SearchStock.waiting_for_search_value)
-async def process_smart_search(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel' or message.text == '❌ Отмена':
-        await cancel_handler(message, state)
-        return
-    
-    search_term = message.text.strip()
-    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("❌ Ошибка: пользователь не найден")
-        return
-    
-    user_id, user_role = user[0], user[1]
-    
-    try:
-        # Сначала проверим статистику базы для диагностики
-        db_stats = await db.get_database_stats()
-        logger.info(f"Database stats - Users: {db_stats['users']}, Stock: {db_stats['stock']}")
-        
-        if db_stats['stock'] == 0:
-            await message.answer(
-                "📭 В базе данных пока нет товаров.\n\n"
-                "💡 <i>Добавьте товары через меню '➕ Добавить товар' или '📤 Загрузить Excel'</i>",
-                reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
-            )
-            await state.clear()
-            return
-        
-        # ★★★★ ИЗМЕНЕНИЕ: ВСЕ пользователи ищут по ВСЕМ товарам ★★★★
-        query = """
-            SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                   s.qty_available, s.retail_price, s.wholesale_price, 
-                   s.warehouse_location, u.company_name, u.phone, u.email
-            FROM stock s 
-            JOIN users u ON s.user_id = u.id 
-            WHERE s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
-            ORDER BY s.date DESC
-        """
-        params = (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
-        
-        stock_items = await db.fetchall(query, params)
-        
-        if not stock_items:
-            await message.answer(
-                f"❌ По запросу '{search_term}' ничего не найдено.\n\n"
-                f"💡 <i>Попробуйте другой поисковый запрос или посмотрите все товары через '📦 Все товары'</i>",
-                reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
-            )
-            await state.clear()
-            return
-        
-        filename = await create_search_excel(stock_items, user_role, "smart_search")
-        
-        if filename:
-            with open(filename, 'rb') as file:
-                caption = f"🔍 Результаты поиска по '{search_term}' ({len(stock_items)} товаров)"
-                if user_role == 'Покупатель':
-                    caption += "\n👀 Показаны только розничные цены"
-                else:
-                    caption += "\n💰 Показаны розничные и оптовые цены"
-                
-                await message.answer_document(
-                    document=types.BufferedInputFile(file.read(), filename=f"поиск_{search_term}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
-                    caption=caption
-                )
-        
-    except Exception as e:
-        logger.error(f"Smart search error: {e}")
-        await message.answer(f"❌ Ошибка при поиске: {str(e)}\n\n💡 Проверьте структуру базы данных.")
-    
-    await state.clear()
-    user_role = await get_user_role(message.from_user.id)
-    await message.answer(
-        "Поиск завершен.", 
-        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
-    )
-
-async def execute_all_stock_search(message: Message, state: FSMContext):
-    """Выгрузка всех товаров всех дилеров"""
-    try:
-        user_role = await get_user_role(message.from_user.id)
-        
-        await message.answer("⏳ Формирую выгрузку всех товаров...")
-        
-        # Получаем ВСЕ товары ВСЕХ дилеров
-        query = """
-            SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                   s.qty_available, s.retail_price, s.wholesale_price, 
-                   s.warehouse_location, u.company_name, u.phone, u.email
-            FROM stock s 
-            JOIN users u ON s.user_id = u.id 
-            ORDER BY s.date DESC
-        """
-        
-        stock_items = await db.fetchall(query)
-        
-        if not stock_items:
-            await message.answer(
-                "📭 В системе пока нет товаров.",
-                reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
-            )
-            await state.clear()
-            return
-        
-        filename = await create_search_excel(stock_items, user_role, "all_stock")
-        
-        if filename:
-            with open(filename, 'rb') as file:
-                caption = f"📦 Все товары системы ({len(stock_items)} товаров)"
-                if user_role == 'Покупатель':
-                    caption += "\n👀 Показаны только розничные цены"
-                else:
-                    caption += "\n💰 Показаны розничные и оптовые цены"
-                
-                await message.answer_document(
-                    document=types.BufferedInputFile(
-                        file.read(), 
-                        filename=f"все_товары_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                    ),
-                    caption=caption
-                )
-        
-    except Exception as e:
-        logger.error(f"All stock search error: {e}")
-        await message.answer(f"❌ Ошибка при выгрузке всех товаров: {str(e)}")
-    
-    await state.clear()
-    user_role = await get_user_role(message.from_user.id)
-    await message.answer(
-        "Выгрузка завершена.", 
-        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
-    )
-
-def get_admin_keyboard():
-    """Клавиатура админ-панели"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="💾 Экспорт"), KeyboardButton(text="🔄 Бэкап")],
-            [KeyboardButton(text="🗃️ SQL"), KeyboardButton(text="⚙️ Настройки")],
-            [KeyboardButton(text="🏠 Главное меню")]
-        ],
-        resize_keyboard=True
-    )
-
-def get_cancel_keyboard():
-    """Простая клавиатура с кнопкой отмены"""
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True
-    )
-
-def get_delete_selection_keyboard(suggestions):
-    """Клавиатура для выбора товара для удаления"""
-    keyboard = []
-    for item in suggestions:
-        item_id, sku, size, pattern, brand, qty = item
-        button_text = f"{sku} | {size} | {brand} | {qty}шт"
-        if len(button_text) > 50:  # Ограничиваем длину текста
-            button_text = button_text[:47] + "..."
-        keyboard.append([KeyboardButton(text=button_text)])
-    
-    keyboard.append([KeyboardButton(text="❌ Отмена")])
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-
-async def create_search_excel(stock_items, user_role, search_type="результаты"):
-    """Создает Excel файл с результатами поиска (скрывает оптовую цену для покупателей)"""
-    if not stock_items:
-        return None
-    
-    if not os.path.exists('temp_files'):
-        os.makedirs('temp_files')
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"temp_files/search_{timestamp}.xlsx"
-    
-    # Для покупателей скрываем оптовую цену и контакты других пользователей
-    if user_role == 'Покупатель':
-        columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
-                  'qty_available', 'retail_price', 'warehouse_location', 'company_name']
-        
-        processed_items = []
-        for item in stock_items:
-            processed_item = list(item[:6]) + [item[6]] + [item[8]] + [item[9]]  # Пропускаем wholesale_price и контакты
-            processed_items.append(processed_item)
-        
-        df = pd.DataFrame(processed_items, columns=columns)
-    else:
-        # Для дилеров и админов показываем все данные
-        columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
-                  'qty_available', 'retail_price', 'wholesale_price', 'warehouse_location',
-                  'company_name', 'phone', 'email']
-        df = pd.DataFrame(stock_items, columns=columns)
-    
-    df.to_excel(filename, index=False, engine='openpyxl')
-    return filename
-
-async def send_notifications(sub_type: str, sub_value: str, message: str):
-    """Отправка уведомлений подписчикам"""
-    try:
-        subscribers = await db.get_subscribers(sub_type, sub_value)
-        for subscriber_id in subscribers:
-            try:
-                await bot.send_message(subscriber_id, f"🔔 Уведомление: {message}")
-            except Exception as e:
-                logger.error(f"Error sending notification to {subscriber_id}: {e}")
-    except Exception as e:
-        logger.error(f"Error getting subscribers: {e}")
 
 # =============================================================================
 # ЗАГРУЗКА EXCEL ФАЙЛОВ
@@ -1275,39 +992,23 @@ async def process_smart_search(message: Message, state: FSMContext):
     user_id, user_role = user[0], user[1]
     
     try:
-        # Поиск товаров для текущего пользователя (если дилер) или всех товаров (если покупатель)
-        if user_role == 'Дилер' or is_admin(message.from_user.id):
-            # Дилер ищет только свои товары
-            query = """
-                SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                       s.qty_available, s.retail_price, s.wholesale_price, 
-                       s.warehouse_location, u.company_name, u.phone, u.email
-                FROM stock s 
-                JOIN users u ON s.user_id = u.id 
-                WHERE s.user_id = ? AND (
-                    s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
-                )
-                ORDER BY s.date DESC
-            """
-            params = (user_id, f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
-        else:
-            # Покупатель ищет все товары
-            query = """
-                SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                       s.qty_available, s.retail_price, s.wholesale_price, 
-                       s.warehouse_location, u.company_name, u.phone, u.email
-                FROM stock s 
-                JOIN users u ON s.user_id = u.id 
-                WHERE s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
-                ORDER BY s.date DESC
-            """
-            params = (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
+        # Поиск по ВСЕМ товарам для ВСЕХ пользователей
+        query = """
+            SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
+                   s.qty_available, s.retail_price, s.wholesale_price, 
+                   s.warehouse_location, u.company_name, u.phone, u.email
+            FROM stock s 
+            JOIN users u ON s.user_id = u.id 
+            WHERE s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
+            ORDER BY s.date DESC
+        """
+        params = (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
         
         stock_items = await db.fetchall(query, params)
         
         if not stock_items:
             await message.answer(
-                "❌ По вашему запросу ничего не найдено.",
+                f"❌ По запросу '{search_term}' ничего не найдено.",
                 reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
             )
             await state.clear()
@@ -1320,9 +1021,14 @@ async def process_smart_search(message: Message, state: FSMContext):
                 caption = f"🔍 Результаты поиска по '{search_term}' ({len(stock_items)} товаров)"
                 if user_role == 'Покупатель':
                     caption += "\n👀 Показаны только розничные цены"
+                else:
+                    caption += "\n💰 Показаны розничные и оптовые цены"
                 
                 await message.answer_document(
-                    document=types.BufferedInputFile(file.read(), filename=f"поиск_{search_term}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+                    document=types.BufferedInputFile(
+                        file.read(), 
+                        filename=f"поиск_{search_term}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    ),
                     caption=caption
                 )
         
