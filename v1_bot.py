@@ -24,7 +24,7 @@ import aiofiles
 # КОНФИГУРАЦИЯ
 # =============================================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8462097188:AAF6RYemT8BMjEtmGRP4lBeDf99j8aJ3Q60")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8294936286:AAGfR-q_GGWIlxS4QlOwhAsJyFtSgFKKK_I")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "7975448643").split(',')))
 DB_PATH = os.getenv("DB_PATH", "tyreterra.db")
 MAX_STOCK_ITEMS = int(os.getenv("MAX_STOCK_ITEMS", "10000"))
@@ -104,7 +104,7 @@ def cleanup_temp_files():
         logger.error(f"Error cleaning temp files: {e}")
 
 # =============================================================================
-# БАЗА ДАННЫХ (АСИНХРОННАЯ)
+# БАЗА ДАННЫХ (АСИНХРОННАЯ) С МИГРАЦИЯМИ
 # =============================================================================
 
 class AsyncDatabase:
@@ -113,63 +113,104 @@ class AsyncDatabase:
     
     async def init_db(self):
         """Инициализация базы данных"""
-        async with aiosqlite.connect(self.db_path, timeout=30.0) as conn:
-            # Таблица пользователей
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER UNIQUE,
-                    name TEXT,
-                    company_name TEXT,
-                    inn TEXT,
-                    phone TEXT,
-                    email TEXT,
-                    role TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Таблица склада
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS stock (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    sku TEXT,
-                    tyre_size TEXT,
-                    tyre_pattern TEXT,
-                    brand TEXT,
-                    country TEXT,
-                    qty_available INTEGER,
-                    retail_price REAL,
-                    wholesale_price REAL,
-                    warehouse_location TEXT,
-                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (id)
-                )
-            ''')
-            
-            # Таблица подписок
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    subscription_type TEXT,
-                    subscription_value TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (id)
-                )
-            ''')
-            
-            # Индексы
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_sku ON stock(sku)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_brand ON stock(brand)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_user ON stock(user_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_size ON stock(tyre_size)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_type ON subscriptions(subscription_type)')
-            
-            await conn.commit()
+        try:
+            async with aiosqlite.connect(self.db_path, timeout=30.0) as conn:
+                # Таблица пользователей
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        telegram_id INTEGER UNIQUE,
+                        name TEXT,
+                        company_name TEXT,
+                        inn TEXT,
+                        phone TEXT,
+                        email TEXT,
+                        role TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица склада
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS stock (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        sku TEXT,
+                        tyre_size TEXT,
+                        tyre_pattern TEXT,
+                        brand TEXT,
+                        country TEXT,
+                        qty_available INTEGER,
+                        retail_price REAL,
+                        wholesale_price REAL,
+                        warehouse_location TEXT,
+                        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (user_id) REFERENCES users (id)
+                    )
+                ''')
+                
+                # Таблица подписок
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        subscription_type TEXT,
+                        subscription_value TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (user_id) REFERENCES users (id)
+                    )
+                ''')
+                
+                # Индексы
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_sku ON stock(sku)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_brand ON stock(brand)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_user ON stock(user_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_size ON stock(tyre_size)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_type ON subscriptions(subscription_type)')
+                
+                await conn.commit()
+                logger.info("✅ Database tables created successfully")
+        except Exception as e:
+            logger.error(f"❌ Database initialization error: {e}")
+            raise
+    
+    async def migrate_database(self):
+        """Миграция базы данных - добавление недостающих колонок и исправления"""
+        try:
+            async with aiosqlite.connect(self.db_path, timeout=30.0) as conn:
+                # Проверяем существование колонок в таблице stock
+                cursor = await conn.execute("PRAGMA table_info(stock)")
+                columns = await cursor.fetchall()
+                column_names = [column[1] for column in columns]
+                
+                # Добавляем created_at если нет
+                if 'created_at' not in column_names:
+                    logger.info("Adding created_at column to stock table...")
+                    await conn.execute('''
+                        ALTER TABLE stock ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ''')
+                    await conn.commit()
+                    logger.info("✅ created_at column added to stock table")
+                
+                # Проверяем таблицу users
+                cursor = await conn.execute("PRAGMA table_info(users)")
+                users_columns = await cursor.fetchall()
+                users_column_names = [column[1] for column in users_columns]
+                
+                if 'created_at' not in users_column_names:
+                    logger.info("Adding created_at column to users table...")
+                    await conn.execute('''
+                        ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ''')
+                    await conn.commit()
+                    logger.info("✅ created_at column added to users table")
+                
+                logger.info("✅ Database migration completed")
+                
+        except Exception as e:
+            logger.error(f"❌ Migration error: {e}")
     
     async def execute(self, query, params=()):
         async with aiosqlite.connect(self.db_path, timeout=30.0) as conn:
@@ -390,7 +431,8 @@ def get_search_keyboard():
     """Клавиатура выбора типа поиска"""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔍 Обычный поиск"), KeyboardButton(text="🎯 Комбинированный поиск")],
+            [KeyboardButton(text="🔍 Поиск по SKU"), KeyboardButton(text="📏 Поиск по размеру")],
+            [KeyboardButton(text="🏭 Поиск по бренду"), KeyboardButton(text="📍 Поиск по складу")],
             [KeyboardButton(text="📊 Все товары"), KeyboardButton(text="❌ Отмена")]
         ],
         resize_keyboard=True
@@ -402,7 +444,7 @@ def get_search_type_keyboard():
         keyboard=[
             [KeyboardButton(text="🏷️ SKU"), KeyboardButton(text="📏 Типоразмер")],
             [KeyboardButton(text="🏭 Бренд"), KeyboardButton(text="📍 Склад")],
-            [KeyboardButton(text="🌍 Страна"), KeyboardButton(text="❌ Отмена")]
+            [KeyboardButton(text="❌ Отмена")]
         ],
         resize_keyboard=True
     )
@@ -457,26 +499,30 @@ async def create_search_excel(stock_items, user_role, search_type="резуль�
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"temp_files/search_{timestamp}.xlsx"
     
-    # Для покупателей скрываем оптовую цену и контакты других пользователей
-    if user_role == 'Покупатель':
-        columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
-                  'qty_available', 'retail_price', 'warehouse_location', 'company_name']
+    try:
+        # Для покупателей скрываем оптовую цену и контакты других пользователей
+        if user_role == 'Покупатель':
+            columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
+                      'qty_available', 'retail_price', 'warehouse_location', 'company_name']
+            
+            processed_items = []
+            for item in stock_items:
+                processed_item = list(item[:6]) + [item[6]] + [item[8]] + [item[9]]  # Пропускаем wholesale_price и контакты
+                processed_items.append(processed_item)
+            
+            df = pd.DataFrame(processed_items, columns=columns)
+        else:
+            # Для дилеров и админов показываем все данные
+            columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
+                      'qty_available', 'retail_price', 'wholesale_price', 'warehouse_location',
+                      'company_name', 'phone', 'email']
+            df = pd.DataFrame(stock_items, columns=columns)
         
-        processed_items = []
-        for item in stock_items:
-            processed_item = list(item[:6]) + [item[6]] + [item[8]] + [item[9]]  # Пропускаем wholesale_price и контакты
-            processed_items.append(processed_item)
-        
-        df = pd.DataFrame(processed_items, columns=columns)
-    else:
-        # Для дилеров и админов показываем все данные
-        columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
-                  'qty_available', 'retail_price', 'wholesale_price', 'warehouse_location',
-                  'company_name', 'phone', 'email']
-        df = pd.DataFrame(stock_items, columns=columns)
-    
-    df.to_excel(filename, index=False, engine='openpyxl')
-    return filename
+        df.to_excel(filename, index=False, engine='openpyxl')
+        return filename
+    except Exception as e:
+        logger.error(f"Error creating Excel file: {e}")
+        return None
 
 async def send_notifications(sub_type: str, sub_value: str, message: str):
     """Отправка уведомлений подписчикам"""
@@ -632,7 +678,7 @@ async def cmd_profile(message: Message):
     await message.answer(profile_text)
 
 # =============================================================================
-# ВЫГРУЗКА СКЛАДА
+# ВЫГРУЗКА СКЛАДА (УЛУЧШЕННАЯ ВЕРСИЯ)
 # =============================================================================
 
 @dp.message(F.text == "📦 Мой склад")
@@ -642,13 +688,19 @@ async def cmd_my_stock(message: Message):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
         return
         
+    logger.info(f"User {message.from_user.id} requested 'My Stock'")
+    
     user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
     
     if not user:
-        await message.answer("Сначала зарегистрируйтесь с помощью /start")
+        await message.answer("❌ Сначала зарегистрируйтесь с помощью /start")
         return
     
     user_id, user_role = user[0], user[1]
+    
+    if user_role != 'Дилер':
+        await message.answer("❌ Только дилеры могут иметь склад")
+        return
     
     try:
         # Получаем товары пользователя
@@ -663,6 +715,8 @@ async def cmd_my_stock(message: Message):
         if not stock_items:
             await message.answer("📭 Ваш склад пуст.")
             return
+        
+        logger.info(f"Found {len(stock_items)} items for user {user_id}")
         
         # Создаем Excel файл
         if not os.path.exists('temp_files'):
@@ -691,30 +745,8 @@ async def cmd_my_stock(message: Message):
         await message.answer(f"❌ Ошибка при выгрузке склада: {str(e)}")
 
 # =============================================================================
-# СИСТЕМА ПОИСКА (УПРОЩЕННАЯ ВЕРСИЯ)
+# СИСТЕМА ПОИСКА (СТАБИЛЬНАЯ ВЕРСИЯ)
 # =============================================================================
-
-def get_search_keyboard():
-    """Упрощенная клавиатура поиска"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Поиск по SKU"), KeyboardButton(text="📏 Поиск по размеру")],
-            [KeyboardButton(text="🏭 Поиск по бренду"), KeyboardButton(text="📍 Поиск по складу")],
-            [KeyboardButton(text="📊 Все товары"), KeyboardButton(text="❌ Отмена")]
-        ],
-        resize_keyboard=True
-    )
-
-def get_search_type_keyboard():
-    """Клавиатура выбора параметра поиска"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🏷️ SKU"), KeyboardButton(text="📏 Типоразмер")],
-            [KeyboardButton(text="🏭 Бренд"), KeyboardButton(text="📍 Склад")],
-            [KeyboardButton(text="❌ Отмена")]
-        ],
-        resize_keyboard=True
-    )
 
 @dp.message(F.text == "🔍 Поиск")
 @dp.message(Command("search"))
@@ -756,11 +788,7 @@ async def process_search_type(message: Message, state: FSMContext):
         "🔍 Поиск по SKU": 'sku',
         "📏 Поиск по размеру": 'tyre_size', 
         "🏭 Поиск по бренду": 'brand',
-        "📍 Поиск по складу": 'warehouse_location',
-        "🏷️ SKU": 'sku',
-        "📏 Типоразмер": 'tyre_size', 
-        "🏭 Бренд": 'brand',
-        "📍 Склад": 'warehouse_location'
+        "📍 Поиск по складу": 'warehouse_location'
     }
     
     if message.text not in param_map:
@@ -886,7 +914,7 @@ async def execute_search(message: Message, state: FSMContext):
     )
 
 # =============================================================================
-# СИСТЕМА УВЕДОМЛЕНИЙ И ПОДПИСОК (УЛУЧШЕННАЯ ВЕРСИЯ)
+# СИСТЕМА УВЕДОМЛЕНИЙ И ПОДПИСОК
 # =============================================================================
 
 @dp.message(F.text == "🔔 Уведомления")
@@ -1080,108 +1108,7 @@ async def process_unsubscribe(callback: types.CallbackQuery):
     await callback.answer()
 
 # =============================================================================
-# УЛУЧШЕННАЯ СИСТЕМА ОТПРАВКИ УВЕДОМЛЕНИЙ
-# =============================================================================
-
-async def send_notifications_for_new_items(user_id: int, company_name: str, new_items: List[dict]):
-    """Отправляет уведомления о новых товарах одним сообщением"""
-    try:
-        user = await db.fetchone("SELECT telegram_id FROM users WHERE id = ?", (user_id,))
-        if not user:
-            return
-        
-        dealer_telegram_id = user[0]
-        
-        # Собираем все подписки, которые могут быть затронуты
-        all_subscriptions = {}
-        
-        for item in new_items:
-            # Бренды
-            if item['brand']:
-                if 'brand' not in all_subscriptions:
-                    all_subscriptions['brand'] = set()
-                all_subscriptions['brand'].add(item['brand'])
-            
-            # Типоразмеры
-            if item['tyre_size']:
-                if 'tyre_size' not in all_subscriptions:
-                    all_subscriptions['tyre_size'] = set()
-                all_subscriptions['tyre_size'].add(item['tyre_size'])
-        
-        # Добавляем дилера
-        all_subscriptions['dealer'] = {company_name}
-        
-        # Для каждого типа подписки собираем подписчиков и отправляем уведомления
-        notifications_sent = set()  # Чтобы не дублировать уведомления одному пользователю
-        
-        for sub_type, values in all_subscriptions.items():
-            for value in values:
-                subscribers = await db.get_subscribers(sub_type, value)
-                
-                for subscriber_id in subscribers:
-                    # Пропускаем самого дилера (чтобы он не получал уведомления о своих же товарах)
-                    if subscriber_id == dealer_telegram_id:
-                        continue
-                    
-                    if subscriber_id not in notifications_sent:
-                        # Формируем общее уведомление для этого пользователя
-                        notification_text = await format_notification_message(sub_type, value, new_items, company_name)
-                        if notification_text:
-                            try:
-                                await bot.send_message(subscriber_id, notification_text)
-                                notifications_sent.add(subscriber_id)
-                                logger.info(f"Уведомление отправлено пользователю {subscriber_id}")
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки уведомления пользователю {subscriber_id}: {e}")
-        
-        return len(notifications_sent)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в send_notifications_for_new_items: {e}")
-        return 0
-
-async def format_notification_message(sub_type: str, value: str, new_items: List[dict], company_name: str) -> str:
-    """Форматирует сообщение уведомления"""
-    type_display = {
-        "brand": f"🏭 Бренд <b>{value}</b>",
-        "tyre_size": f"📏 Типоразмер <b>{value}</b>", 
-        "dealer": f"🏢 Дилер <b>{value}</b>"
-    }.get(sub_type, f"{sub_type} {value}")
-    
-    # Фильтруем товары по подписке
-    filtered_items = []
-    for item in new_items:
-        if sub_type == "brand" and item['brand'] == value:
-            filtered_items.append(item)
-        elif sub_type == "tyre_size" and item['tyre_size'] == value:
-            filtered_items.append(item)
-        elif sub_type == "dealer" and company_name == value:
-            filtered_items.append(item)
-    
-    if not filtered_items:
-        return ""
-    
-    # Ограничиваем количество товаров в уведомлении
-    display_items = filtered_items[:10]  # Максимум 10 товаров в уведомлении
-    
-    message = f"🔔 <b>Новые товары по вашей подписке</b>\n{type_display}\n\n"
-    
-    for i, item in enumerate(display_items, 1):
-        message += f"{i}. {item['brand']} {item['tyre_size']}"
-        if item.get('tyre_pattern'):
-            message += f" {item['tyre_pattern']}"
-        message += f" - {item['qty_available']} шт.\n"
-    
-    if len(filtered_items) > 10:
-        message += f"\n... и еще {len(filtered_items) - 10} товаров"
-    
-    message += f"\n🏢 <i>Дилер: {company_name}</i>"
-    message += f"\n\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    
-    return message
-
-# =============================================================================
-# ОБРАБОТКА ДОБАВЛЕНИЯ ТОВАРОВ С УВЕДОМЛЕНИЯМИ
+# ОБРАБОТКА ДОБАВЛЕНИЯ ТОВАРОВ
 # =============================================================================
 
 @dp.message(F.text == "➕ Добавить товар")
@@ -1492,7 +1419,7 @@ async def process_warehouse_final(message: Message, state: FSMContext, warehouse
     await state.clear()
 
 # =============================================================================
-# АДМИН-ПАНЕЛЬ (ПОЛНАЯ РЕАЛИЗАЦИЯ)
+# АДМИН-ПАНЕЛЬ (СТАБИЛЬНАЯ ВЕРСИЯ)
 # =============================================================================
 
 @dp.message(F.text == "🛠️ Админ")
@@ -1563,10 +1490,10 @@ async def cmd_admin_stock(message: Message):
     try:
         stock_items = await db.fetchall("""
             SELECT s.id, s.sku, s.tyre_size, s.brand, s.qty_available, 
-                   s.retail_price, u.company_name, s.created_at
+                   s.retail_price, u.company_name, s.date
             FROM stock s 
             JOIN users u ON s.user_id = u.id 
-            ORDER BY s.created_at DESC
+            ORDER BY s.date DESC
             LIMIT 100
         """)
         
@@ -1687,10 +1614,10 @@ async def cmd_admin_export(message: Message):
         stock = await db.fetchall("""
             SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
                    s.qty_available, s.retail_price, s.wholesale_price, 
-                   s.warehouse_location, u.company_name, s.created_at
+                   s.warehouse_location, u.company_name, s.date
             FROM stock s 
             JOIN users u ON s.user_id = u.id 
-            ORDER BY s.created_at DESC
+            ORDER BY s.date DESC
         """)
         
         if not os.path.exists('temp_files'):
@@ -2018,7 +1945,10 @@ async def main():
     await db.init_db()
     logger.info("✅ База данных инициализирована")
     
-    for folder in ['temp_files', 'uploads']:
+    await db.migrate_database()
+    logger.info("✅ Миграции базы данных выполнены")
+    
+    for folder in ['temp_files', 'uploads', 'backups']:
         if not os.path.exists(folder):
             os.makedirs(folder)
     
