@@ -516,39 +516,37 @@ async def process_smart_search(message: Message, state: FSMContext):
     user_id, user_role = user[0], user[1]
     
     try:
-        # Поиск товаров для текущего пользователя (если дилер) или всех товаров (если покупатель)
-        if user_role == 'Дилер' or is_admin(message.from_user.id):
-            # Дилер ищет только свои товары
-            query = """
-                SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                       s.qty_available, s.retail_price, s.wholesale_price, 
-                       s.warehouse_location, u.company_name, u.phone, u.email
-                FROM stock s 
-                JOIN users u ON s.user_id = u.id 
-                WHERE s.user_id = ? AND (
-                    s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
-                )
-                ORDER BY s.date DESC
-            """
-            params = (user_id, f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
-        else:
-            # Покупатель ищет все товары
-            query = """
-                SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                       s.qty_available, s.retail_price, s.wholesale_price, 
-                       s.warehouse_location, u.company_name, u.phone, u.email
-                FROM stock s 
-                JOIN users u ON s.user_id = u.id 
-                WHERE s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
-                ORDER BY s.date DESC
-            """
-            params = (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
+        # Сначала проверим статистику базы для диагностики
+        db_stats = await db.get_database_stats()
+        logger.info(f"Database stats - Users: {db_stats['users']}, Stock: {db_stats['stock']}")
+        
+        if db_stats['stock'] == 0:
+            await message.answer(
+                "📭 В базе данных пока нет товаров.\n\n"
+                "💡 <i>Добавьте товары через меню '➕ Добавить товар' или '📤 Загрузить Excel'</i>",
+                reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
+            )
+            await state.clear()
+            return
+        
+        # ★★★★ ИЗМЕНЕНИЕ: ВСЕ пользователи ищут по ВСЕМ товарам ★★★★
+        query = """
+            SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
+                   s.qty_available, s.retail_price, s.wholesale_price, 
+                   s.warehouse_location, u.company_name, u.phone, u.email
+            FROM stock s 
+            JOIN users u ON s.user_id = u.id 
+            WHERE s.sku LIKE ? OR s.tyre_size LIKE ? OR s.tyre_pattern LIKE ? OR s.brand LIKE ?
+            ORDER BY s.date DESC
+        """
+        params = (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%')
         
         stock_items = await db.fetchall(query, params)
         
         if not stock_items:
             await message.answer(
-                "❌ По вашему запросу ничего не найдено.",
+                f"❌ По запросу '{search_term}' ничего не найдено.\n\n"
+                f"💡 <i>Попробуйте другой поисковый запрос или посмотрите все товары через '📦 Все товары'</i>",
                 reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
             )
             await state.clear()
@@ -561,6 +559,8 @@ async def process_smart_search(message: Message, state: FSMContext):
                 caption = f"🔍 Результаты поиска по '{search_term}' ({len(stock_items)} товаров)"
                 if user_role == 'Покупатель':
                     caption += "\n👀 Показаны только розничные цены"
+                else:
+                    caption += "\n💰 Показаны розничные и оптовые цены"
                 
                 await message.answer_document(
                     document=types.BufferedInputFile(file.read(), filename=f"поиск_{search_term}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
@@ -569,7 +569,7 @@ async def process_smart_search(message: Message, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Smart search error: {e}")
-        await message.answer(f"❌ Ошибка при поиске: {str(e)}")
+        await message.answer(f"❌ Ошибка при поиске: {str(e)}\n\n💡 Проверьте структуру базы данных.")
     
     await state.clear()
     user_role = await get_user_role(message.from_user.id)
