@@ -8,12 +8,13 @@ import shutil
 import aiosqlite
 from datetime import datetime
 from collections import deque
+from typing import Dict, List, Set
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 
 import pandas as pd
@@ -23,7 +24,7 @@ import aiofiles
 # КОНФИГУРАЦИЯ
 # =============================================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8294936286:AAGfR-q_GGWIlxS4QlOwhAsJyFtSgFKKK_I")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8462097188:AAF6RYemT8BMjEtmGRP4lBeDf99j8aJ3Q60")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "7975448643").split(',')))
 DB_PATH = os.getenv("DB_PATH", "tyreterra.db")
 MAX_STOCK_ITEMS = int(os.getenv("MAX_STOCK_ITEMS", "10000"))
@@ -113,6 +114,7 @@ class AsyncDatabase:
     async def init_db(self):
         """Инициализация базы данных"""
         async with aiosqlite.connect(self.db_path, timeout=30.0) as conn:
+            # Таблица пользователей
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,6 +129,7 @@ class AsyncDatabase:
                 )
             ''')
             
+            # Таблица склада
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS stock (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,11 +148,26 @@ class AsyncDatabase:
                 )
             ''')
             
+            # Таблица подписок
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    subscription_type TEXT,
+                    subscription_value TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+            
+            # Индексы
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_sku ON stock(sku)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_brand ON stock(brand)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_user ON stock(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_stock_size ON stock(tyre_size)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_type ON subscriptions(subscription_type)')
             
             await conn.commit()
     
@@ -182,6 +200,32 @@ class AsyncDatabase:
             (telegram_id,)
         )
         return result[0] if result else None
+    
+    async def get_user_subscriptions(self, user_id: int) -> List[tuple]:
+        """Получить подписки пользователя"""
+        return await self.fetchall(
+            "SELECT id, subscription_type, subscription_value FROM subscriptions WHERE user_id = ?",
+            (user_id,)
+        )
+    
+    async def add_subscription(self, user_id: int, sub_type: str, sub_value: str):
+        """Добавить подписку"""
+        await self.execute(
+            "INSERT INTO subscriptions (user_id, subscription_type, subscription_value) VALUES (?, ?, ?)",
+            (user_id, sub_type, sub_value)
+        )
+    
+    async def remove_subscription(self, subscription_id: int):
+        """Удалить подписку"""
+        await self.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))
+    
+    async def get_subscribers(self, sub_type: str, sub_value: str) -> List[int]:
+        """Получить пользователей подписанных на определенные уведомления"""
+        result = await self.fetchall(
+            "SELECT DISTINCT u.telegram_id FROM users u JOIN subscriptions s ON u.id = s.user_id WHERE s.subscription_type = ? AND s.subscription_value = ?",
+            (sub_type, sub_value)
+        )
+        return [row[0] for row in result]
 
 db = AsyncDatabase()
 
@@ -217,6 +261,7 @@ class AddStock(StatesGroup):
 class SearchStock(StatesGroup):
     waiting_for_search_type = State()
     waiting_for_search_value = State()
+    waiting_for_combined_search = State()
 
 class DeleteItem(StatesGroup):
     waiting_for_sku = State()
@@ -233,6 +278,14 @@ class AdminPanel(StatesGroup):
     waiting_for_delete_id = State()
     waiting_for_sql_query = State()
     confirmation = State()
+
+class EditProfile(StatesGroup):
+    waiting_for_field = State()
+    waiting_for_new_value = State()
+
+class SubscriptionState(StatesGroup):
+    waiting_for_type = State()
+    waiting_for_value = State()
 
 # =============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -260,72 +313,136 @@ def validate_phone(phone):
     phone = phone.replace('+7', '8').replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
     return phone.isdigit() and len(phone) == 11 and phone.startswith('8')
 
-# Клавиатуры
+def normalize_tyre_size(size: str) -> str:
+    """Нормализация типоразмера для поиска"""
+    if not size:
+        return ""
+    
+    # Убираем лишние пробелы, приводим к верхнему регистру
+    size = size.upper().strip()
+    
+    # Заменяем точки на слеши, убираем лишние пробелы вокруг R
+    size = re.sub(r'[\.]', '/', size)  # Заменяем точки на слеши
+    size = re.sub(r'\s*R\s*', 'R', size)  # Убираем пробелы вокруг R
+    size = re.sub(r'\s+', ' ', size)  # Заменяем множественные пробелы на один
+    
+    return size
+
+def size_matches(search_size: str, stock_size: str) -> bool:
+    """Проверяет совпадение типоразмеров с учетом разных форматов"""
+    normalized_search = normalize_tyre_size(search_size)
+    normalized_stock = normalize_tyre_size(stock_size)
+    
+    # Точное совпадение после нормализации
+    if normalized_search == normalized_stock:
+        return True
+    
+    # Частичное совпадение (если поисковый запрос содержится в размере)
+    if normalized_search in normalized_stock or normalized_stock in normalized_search:
+        return True
+    
+    return False
+
+# =============================================================================
+# КЛАВИАТУРЫ
+# =============================================================================
+
 def get_role_keyboard():
+    """Клавиатура выбора роли при регистрации"""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Дилер"), KeyboardButton(text="Покупатель")]],
+        keyboard=[
+            [KeyboardButton(text="Дилер"), KeyboardButton(text="Покупатель")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def get_main_menu_keyboard(telegram_id: int, is_admin: bool = False, role: str = "Покупатель"):
+    """Основное меню с кнопками"""
+    buttons = []
+    
+    if is_admin:
+        buttons = [
+            [KeyboardButton(text="📦 Мой склад"), KeyboardButton(text="🔍 Поиск")],
+            [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="✏️ Профиль")],
+            [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="🛠️ Админ")],
+            [KeyboardButton(text="❓ Помощь")]
+        ]
+    elif role == "Дилер":
+        buttons = [
+            [KeyboardButton(text="📦 Мой склад"), KeyboardButton(text="🔍 Поиск")],
+            [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="✏️ Профиль")],
+            [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="❓ Помощь")]
+        ]
+    else:  # Покупатель
+        buttons = [
+            [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="✏️ Профиль")],
+            [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="❓ Помощь")]
+        ]
+    
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие..."
+    )
+
+def get_search_keyboard():
+    """Клавиатура выбора типа поиска"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Обычный поиск"), KeyboardButton(text="🎯 Комбинированный поиск")],
+            [KeyboardButton(text="📊 Все товары"), KeyboardButton(text="❌ Отмена")]
+        ],
         resize_keyboard=True
     )
 
-async def get_main_keyboard(telegram_id):
-    """Возвращает клавиатуру в зависимости от роли пользователя"""
-    
-    if is_admin(telegram_id):
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="/addstock"), KeyboardButton(text="/mystock")],
-                [KeyboardButton(text="/search"), KeyboardButton(text="/deletestock")],
-                [KeyboardButton(text="/deleteitem"), KeyboardButton(text="/admin")],
-                [KeyboardButton(text="/help")]
-            ],
-            resize_keyboard=True
-        )
-    
-    user_role = await get_user_role(telegram_id)
-    
-    if user_role == 'Дилер':
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="/addstock"), KeyboardButton(text="/mystock")],
-                [KeyboardButton(text="/search"), KeyboardButton(text="/deletestock")],
-                [KeyboardButton(text="/deleteitem"), KeyboardButton(text="/help")]
-            ],
-            resize_keyboard=True
-        )
-    else:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="/search"), KeyboardButton(text="/help")]
-            ],
-            resize_keyboard=True
-        )
-
-def get_search_keyboard():
+def get_search_type_keyboard():
+    """Клавиатура выбора параметра поиска"""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="SKU"), KeyboardButton(text="Типоразмер")],
-            [KeyboardButton(text="Бренд"), KeyboardButton(text="Склад")],
-            [KeyboardButton(text="Все")]
+            [KeyboardButton(text="🏷️ SKU"), KeyboardButton(text="📏 Типоразмер")],
+            [KeyboardButton(text="🏭 Бренд"), KeyboardButton(text="📍 Склад")],
+            [KeyboardButton(text="🌍 Страна"), KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_subscription_keyboard():
+    """Клавиатура управления подписками"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🏭 Бренд"), KeyboardButton(text="📏 Типоразмер")],
+            [KeyboardButton(text="🏢 Дилер"), KeyboardButton(text="📋 Мои подписки")],
+            [KeyboardButton(text="❌ Отмена")]
         ],
         resize_keyboard=True
     )
 
 def get_confirmation_keyboard():
+    """Клавиатура подтверждения действий"""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]],
+        keyboard=[
+            [KeyboardButton(text="✅ Да"), KeyboardButton(text="❌ Нет")]
+        ],
         resize_keyboard=True
     )
 
 def get_admin_keyboard():
+    """Клавиатура админ-панели"""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="/admin_users"), KeyboardButton(text="/admin_stock")],
-            [KeyboardButton(text="/admin_stats"), KeyboardButton(text="/admin_export")],
-            [KeyboardButton(text="/admin_backup"), KeyboardButton(text="/admin_sql")],
-            [KeyboardButton(text="/admin_edit_user"), KeyboardButton(text="/admin_edit_stock")],
-            [KeyboardButton(text="/admin_delete_user"), KeyboardButton(text="/admin_delete_stock")],
-            [KeyboardButton(text="/admin_clear_cache"), KeyboardButton(text="/help")]
+            [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="📦 Весь склад")],
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="💾 Экспорт")],
+            [KeyboardButton(text="🔄 Бэкап"), KeyboardButton(text="🗃️ SQL")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="🏠 Главное меню")]
         ],
+        resize_keyboard=True
+    )
+
+def get_cancel_keyboard():
+    """Простая клавиатура с кнопкой отмены"""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True
     )
 
@@ -361,11 +478,24 @@ async def create_search_excel(stock_items, user_role, search_type="резуль�
     df.to_excel(filename, index=False, engine='openpyxl')
     return filename
 
+async def send_notifications(sub_type: str, sub_value: str, message: str):
+    """Отправка уведомлений подписчикам"""
+    try:
+        subscribers = await db.get_subscribers(sub_type, sub_value)
+        for subscriber_id in subscribers:
+            try:
+                await bot.send_message(subscriber_id, f"🔔 Уведомление: {message}")
+            except Exception as e:
+                logger.error(f"Error sending notification to {subscriber_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error getting subscribers: {e}")
+
 # =============================================================================
-# ОСНОВНЫЕ КОМАНДЫ
+# ОСНОВНЫЕ КОМАНДЫ И МЕНЮ
 # =============================================================================
 
 @dp.message(Command("cancel"))
+@dp.message(F.text == "❌ Отмена")
 async def cancel_handler(message: Message, state: FSMContext):
     if await check_rate_limit(message.from_user.id):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
@@ -377,9 +507,15 @@ async def cancel_handler(message: Message, state: FSMContext):
         return
     
     await state.clear()
-    await message.answer("❌ Операция отменена.", reply_markup=await get_main_keyboard(message.from_user.id))
+    user_role = await get_user_role(message.from_user.id)
+    is_admin_user = is_admin(message.from_user.id)
+    await message.answer(
+        "❌ Операция отменена.", 
+        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin_user, user_role)
+    )
 
 @dp.message(Command("start"))
+@dp.message(F.text == "🏠 Главное меню")
 async def cmd_start(message: Message, state: FSMContext):
     if await check_rate_limit(message.from_user.id):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
@@ -400,12 +536,1362 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.set_state(Registration.waiting_for_role)
     else:
         role = user[7]
+        is_admin_user = is_admin(user_id)
         await message.answer(
-            f"С возвращением, {user_name}!\n"
-            f"Ваша роль: {role}\n"
-            "Используйте команды для работы с системой:",
-            reply_markup=await get_main_keyboard(user_id)
+            f"👋 С возвращением, {user_name}!\n"
+            f"🎯 Ваша роль: {role}\n\n"
+            "Выберите действие:",
+            reply_markup=get_main_menu_keyboard(user_id, is_admin_user, role)
         )
+
+@dp.message(F.text == "❓ Помощь")
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    user_role = await get_user_role(message.from_user.id)
+    is_admin_user = is_admin(message.from_user.id)
+    
+    if is_admin_user:
+        help_text = (
+            "🤖 <b>Tyreterra Bot - Помощь (Админ)</b>\n\n"
+            "👤 <b>Основные команды:</b>\n"
+            "📦 Мой склад - Скачать мой склад\n"
+            "🔍 Поиск - Поиск товаров\n"
+            "➕ Добавить товар - Добавить товар на склад\n"
+            "✏️ Профиль - Редактировать профиль\n"
+            "🔔 Уведомления - Управление подписками\n\n"
+            "🛠️ <b>Админ-команды:</b>\n"
+            "🛠️ Админ - Управление системой\n\n"
+            "❌ Отмена операций: кнопка '❌ Отмена'"
+        )
+    elif user_role == 'Дилер':
+        help_text = (
+            "🤖 <b>Tyreterra Bot - Помощь (Дилер)</b>\n\n"
+            "📦 <b>Управление складом:</b>\n"
+            "📦 Мой склад - Скачать мой склад в Excel\n"
+            "➕ Добавить товар - Добавить товар на склад\n"
+            "⚙️ Управление товарами - Удаление товаров\n\n"
+            "🔍 <b>Поиск:</b>\n"
+            "🔍 Поиск - Поиск товаров у других пользователей\n"
+            "🎯 Комбинированный поиск - Расширенный поиск\n\n"
+            "🔔 <b>Уведомления:</b>\n"
+            "Подпишитесь на интересующие товары\n\n"
+            "❌ <b>Отмена операций:</b>\n"
+            "В любой момент можно отменить операцию кнопкой '❌ Отмена'"
+        )
+    else:
+        help_text = (
+            "🤖 <b>Tyreterra Bot - Помощь (Покупатель)</b>\n\n"
+            "🔍 <b>Поиск:</b>\n"
+            "🔍 Поиск - Поиск товаров у дилеров\n"
+            "🎯 Комбинированный поиск - Расширенный поиск\n"
+            "Показываются только розничные цены\n\n"
+            "🔔 <b>Уведомления:</b>\n"
+            "Подпишитесь на интересующие товары\n\n"
+            "📞 <b>Контакты:</b>\n"
+            "В результатах поиска вы увидите контакты компаний\n\n"
+            "❌ <b>Отмена операций:</b>\n"
+            "В любой момент можно отменить операцию кнопкой '❌ Отмена'"
+        )
+    
+    await message.answer(help_text)
+
+# =============================================================================
+# ПРОФИЛЬ И РЕДАКТИРОВАНИЕ
+# =============================================================================
+
+@dp.message(F.text == "✏️ Профиль")
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    user = await db.fetchone("SELECT * FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    
+    if not user:
+        await message.answer("Сначала зарегистрируйтесь с помощью /start")
+        return
+    
+    profile_text = (
+        f"👤 <b>Ваш профиль:</b>\n\n"
+        f"🆔 ID: {user[0]}\n"
+        f"👤 Имя: {user[2]}\n"
+        f"🏢 Компания: {user[3]}\n"
+        f"📋 ИНН: {user[4]}\n"
+        f"📞 Телефон: {user[5]}\n"
+        f"📧 Email: {user[6]}\n"
+        f"🎯 Роль: {user[7]}\n"
+        f"📅 Регистрация: {user[8]}\n\n"
+        f"✏️ Для редактирования используйте команду /editprofile"
+    )
+    
+    await message.answer(profile_text)
+
+# =============================================================================
+# ВЫГРУЗКА СКЛАДА
+# =============================================================================
+
+@dp.message(F.text == "📦 Мой склад")
+@dp.message(Command("mystock"))
+async def cmd_my_stock(message: Message):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    
+    if not user:
+        await message.answer("Сначала зарегистрируйтесь с помощью /start")
+        return
+    
+    user_id, user_role = user[0], user[1]
+    
+    try:
+        # Получаем товары пользователя
+        stock_items = await db.fetchall("""
+            SELECT sku, tyre_size, tyre_pattern, brand, country, 
+                   qty_available, retail_price, wholesale_price, warehouse_location
+            FROM stock 
+            WHERE user_id = ?
+            ORDER BY date DESC
+        """, (user_id,))
+        
+        if not stock_items:
+            await message.answer("📭 Ваш склад пуст.")
+            return
+        
+        # Создаем Excel файл
+        if not os.path.exists('temp_files'):
+            os.makedirs('temp_files')
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"temp_files/my_stock_{timestamp}.xlsx"
+        
+        columns = ['SKU', 'Типоразмер', 'Модель', 'Бренд', 'Страна', 
+                  'Количество', 'Розничная цена', 'Оптовая цена', 'Склад']
+        
+        df = pd.DataFrame(stock_items, columns=columns)
+        df.to_excel(filename, index=False, engine='openpyxl')
+        
+        with open(filename, 'rb') as file:
+            await message.answer_document(
+                document=types.BufferedInputFile(
+                    file.read(), 
+                    filename=f"мой_склад_{timestamp}.xlsx"
+                ),
+                caption=f"📦 Ваш склад ({len(stock_items)} товаров)"
+            )
+            
+    except Exception as e:
+        logger.error(f"My stock export error: {e}")
+        await message.answer(f"❌ Ошибка при выгрузке склада: {str(e)}")
+
+# =============================================================================
+# СИСТЕМА ПОИСКА (УПРОЩЕННАЯ ВЕРСИЯ)
+# =============================================================================
+
+def get_search_keyboard():
+    """Упрощенная клавиатура поиска"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Поиск по SKU"), KeyboardButton(text="📏 Поиск по размеру")],
+            [KeyboardButton(text="🏭 Поиск по бренду"), KeyboardButton(text="📍 Поиск по складу")],
+            [KeyboardButton(text="📊 Все товары"), KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_search_type_keyboard():
+    """Клавиатура выбора параметра поиска"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🏷️ SKU"), KeyboardButton(text="📏 Типоразмер")],
+            [KeyboardButton(text="🏭 Бренд"), KeyboardButton(text="📍 Склад")],
+            [KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+@dp.message(F.text == "🔍 Поиск")
+@dp.message(Command("search"))
+async def cmd_search(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    user = await db.fetchone("SELECT role FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    
+    if not user:
+        await message.answer("Сначала зарегистрируйтесь с помощью /start")
+        return
+    
+    await message.answer(
+        "🔍 <b>Поиск товаров</b>\n\n"
+        "Выберите параметр для поиска:",
+        reply_markup=get_search_keyboard()
+    )
+    await state.set_state(SearchStock.waiting_for_search_type)
+
+@dp.message(SearchStock.waiting_for_search_type)
+async def process_search_type(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == "❌ Отмена":
+        await cancel_handler(message, state)
+        return
+        
+    if message.text == "📊 Все товары":
+        await state.update_data(search_type='all', search_value='%')
+        await execute_search(message, state)
+        return
+    
+    # Простой поиск по одному параметру
+    param_map = {
+        "🔍 Поиск по SKU": 'sku',
+        "📏 Поиск по размеру": 'tyre_size', 
+        "🏭 Поиск по бренду": 'brand',
+        "📍 Поиск по складу": 'warehouse_location',
+        "🏷️ SKU": 'sku',
+        "📏 Типоразмер": 'tyre_size', 
+        "🏭 Бренд": 'brand',
+        "📍 Склад": 'warehouse_location'
+    }
+    
+    if message.text not in param_map:
+        await message.answer("Пожалуйста, выберите параметр из предложенных вариантов:")
+        return
+    
+    search_type = param_map[message.text]
+    await state.update_data(search_type=search_type)
+    
+    prompt_text = f"Введите значение для поиска:"
+    
+    if "SKU" in message.text:
+        prompt_text = "Введите артикул (SKU):"
+    elif "размер" in message.text.lower():
+        prompt_text = "Введите типоразмер (например: 195/65 R15):"
+    elif "бренд" in message.text.lower():
+        prompt_text = "Введите название бренда:"
+    elif "склад" in message.text.lower():
+        prompt_text = "Введите название склада:"
+    
+    await message.answer(prompt_text, reply_markup=get_cancel_keyboard())
+    await state.set_state(SearchStock.waiting_for_search_value)
+
+@dp.message(SearchStock.waiting_for_search_value)
+async def process_search_value(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    search_data = await state.get_data()
+    
+    if message.text.lower() == 'все':
+        search_value = '%'
+    else:
+        search_value = f'%{message.text}%'
+    
+    await state.update_data(search_value=search_value)
+    await execute_search(message, state)
+
+async def execute_search(message: Message, state: FSMContext):
+    """Выполнение поиска"""
+    try:
+        search_data = await state.get_data()
+        user_role = await get_user_role(message.from_user.id)
+        
+        cache_key = f"search_{search_data.get('search_type', 'all')}_{search_data.get('search_value', 'all')}_{user_role}"
+        cached_data = cache.get(cache_key)
+        
+        if cached_data:
+            filename, stock_count = cached_data
+            if os.path.exists(filename):
+                with open(filename, 'rb') as file:
+                    caption = f"🔍 Результаты поиска ({stock_count} товаров) [КЭШ]"
+                    if user_role == 'Покупатель':
+                        caption += "\n👀 Показаны только розничные цены"
+                    
+                    await message.answer_document(
+                        document=types.BufferedInputFile(file.read(), filename=f"результаты_поиска_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"),
+                        caption=caption
+                    )
+                await state.clear()
+                user_role = await get_user_role(message.from_user.id)
+                await message.answer(
+                    "Поиск завершен.", 
+                    reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
+                )
+                return
+        
+        if search_data['search_type'] == 'all':
+            query = """SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
+                              s.qty_available, s.retail_price, s.wholesale_price, 
+                              s.warehouse_location, u.company_name, u.phone, u.email
+                       FROM stock s 
+                       JOIN users u ON s.user_id = u.id 
+                       ORDER BY s.date DESC"""
+            params = ()
+        else:
+            query = f"""SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
+                               s.qty_available, s.retail_price, s.wholesale_price, 
+                               s.warehouse_location, u.company_name, u.phone, u.email
+                        FROM stock s 
+                        JOIN users u ON s.user_id = u.id 
+                        WHERE s.{search_data['search_type']} LIKE ?
+                        ORDER BY s.date DESC"""
+            params = (search_data['search_value'],)
+        
+        stock_items = await db.fetchall(query, params)
+        
+        if not stock_items:
+            await message.answer(
+                "❌ По вашему запросу ничего не найдено.",
+                reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
+            )
+        else:
+            filename = await create_search_excel(stock_items, user_role, search_data.get('search_type', 'search'))
+            
+            if filename:
+                cache.set(cache_key, (filename, len(stock_items)))
+                
+                with open(filename, 'rb') as file:
+                    caption = f"🔍 Результаты поиска ({len(stock_items)} товаров)"
+                    if user_role == 'Покупатель':
+                        caption += "\n👀 Показаны только розничные цены"
+                    
+                    await message.answer_document(
+                        document=types.BufferedInputFile(file.read(), filename=f"результаты_поиска_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+                        caption=caption
+                    )
+                
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await message.answer(f"❌ Ошибка при поиске: {str(e)}")
+    
+    await state.clear()
+    user_role = await get_user_role(message.from_user.id)
+    await message.answer(
+        "Поиск завершен.", 
+        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_role)
+    )
+
+# =============================================================================
+# СИСТЕМА УВЕДОМЛЕНИЙ И ПОДПИСОК (УЛУЧШЕННАЯ ВЕРСИЯ)
+# =============================================================================
+
+@dp.message(F.text == "🔔 Уведомления")
+@dp.message(Command("subscriptions"))
+async def cmd_subscriptions(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    
+    if not user:
+        await message.answer("Сначала зарегистрируйтесь с помощью /start")
+        return
+    
+    await message.answer(
+        "🔔 <b>Управление подписками</b>\n\n"
+        "Вы можете подписаться на уведомления о:\n"
+        "• 🏭 Новые товары определенного бренда\n"
+        "• 📏 Новые товары определенного типоразмера\n"
+        "• 🏢 Новые товары от определенного дилера\n\n"
+        "<i>💡 Уведомления приходят одним сообщением при добавлении новых товаров</i>\n\n"
+        "Выберите действие:",
+        reply_markup=get_subscription_keyboard()
+    )
+    await state.set_state(SubscriptionState.waiting_for_type)
+
+@dp.message(SubscriptionState.waiting_for_type)
+async def process_subscription_type(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == "📋 Мои подписки":
+        await show_user_subscriptions(message, state)
+        return
+        
+    if message.text == "❌ Отмена":
+        await cancel_handler(message, state)
+        return
+    
+    type_map = {
+        "🏭 Бренд": "brand",
+        "📏 Типоразмер": "tyre_size", 
+        "🏢 Дилер": "dealer"
+    }
+    
+    if message.text not in type_map:
+        await message.answer("Пожалуйста, выберите тип подписки из предложенных вариантов:")
+        return
+    
+    sub_type = type_map[message.text]
+    await state.update_data(subscription_type=sub_type)
+    
+    type_display = {
+        "brand": "бренд",
+        "tyre_size": "типоразмер", 
+        "dealer": "дилера"
+    }.get(sub_type, sub_type)
+    
+    prompt_text = f"Введите {type_display} для подписки:"
+    
+    await message.answer(prompt_text, reply_markup=get_cancel_keyboard())
+    await state.set_state(SubscriptionState.waiting_for_value)
+
+@dp.message(SubscriptionState.waiting_for_value)
+async def process_subscription_value(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+    
+    await process_subscription_value_internal(message, state, message.text)
+
+async def process_subscription_value_internal(message: Message, state: FSMContext, value: str):
+    """Общая логика обработки значения подписки"""
+    user_data = await state.get_data()
+    sub_type = user_data['subscription_type']
+    
+    user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    user_id = user[0]
+    
+    # Проверяем, нет ли уже такой подписки
+    existing = await db.fetchone(
+        "SELECT id FROM subscriptions WHERE user_id = ? AND subscription_type = ? AND subscription_value = ?",
+        (user_id, sub_type, value)
+    )
+    
+    type_display = {
+        "brand": "бренд",
+        "tyre_size": "типоразмер", 
+        "dealer": "дилер"
+    }.get(sub_type, sub_type)
+    
+    if existing:
+        await message.answer(f"❌ Вы уже подписаны на {type_display} <b>{value}</b>")
+    else:
+        await db.add_subscription(user_id, sub_type, value)
+        await message.answer(f"✅ Вы успешно подписались на уведомления:\n{type_display} <b>{value}</b>")
+    
+    user_role = await get_user_role(message.from_user.id)
+    is_admin_user = is_admin(message.from_user.id)
+    await message.answer(
+        "Выберите следующее действие:",
+        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin_user, user_role)
+    )
+    await state.clear()
+
+async def show_user_subscriptions(message: Message, state: FSMContext):
+    """Показать текущие подписки пользователя с кнопками удаления"""
+    user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    user_id = user[0]
+    
+    subscriptions = await db.get_user_subscriptions(user_id)
+    
+    if not subscriptions:
+        await message.answer("📭 У вас пока нет активных подписок.")
+        await state.clear()
+        user_role = await get_user_role(message.from_user.id)
+        is_admin_user = is_admin(message.from_user.id)
+        await message.answer(
+            "Выберите действие:",
+            reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin_user, user_role)
+        )
+        return
+    
+    subs_text = "📋 <b>Ваши подписки:</b>\n\n"
+    keyboard = []
+    
+    for sub_id, sub_type, sub_value in subscriptions:
+        type_display = {
+            "brand": "🏭 Бренд",
+            "tyre_size": "📏 Типоразмер", 
+            "dealer": "🏢 Дилер"
+        }.get(sub_type, sub_type)
+        
+        subs_text += f"• {type_display}: <b>{sub_value}</b>\n"
+        keyboard.append([InlineKeyboardButton(
+            text=f"❌ Отписаться от {sub_value}", 
+            callback_data=f"unsub_{sub_id}"
+        )])
+    
+    # Добавляем кнопку "Отписаться от всего"
+    keyboard.append([InlineKeyboardButton(
+        text="🗑️ Отписаться от ВСЕХ уведомлений", 
+        callback_data="unsub_all"
+    )])
+    
+    await message.answer(subs_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("unsub_"))
+async def process_unsubscribe(callback: types.CallbackQuery):
+    """Обработка отписки"""
+    if callback.data == "unsub_all":
+        # Отписка от всех уведомлений
+        user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (callback.from_user.id,))
+        if user:
+            user_id = user[0]
+            await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+            await callback.message.edit_text("✅ Вы отписались от всех уведомлений!")
+        else:
+            await callback.message.edit_text("❌ Ошибка: пользователь не найден")
+    else:
+        # Отписка от конкретной подписки
+        sub_id = int(callback.data[6:])  # Убираем префикс "unsub_"
+        
+        # Получаем информацию о подписке перед удалением
+        subscription = await db.fetchone(
+            "SELECT subscription_type, subscription_value FROM subscriptions WHERE id = ?", 
+            (sub_id,)
+        )
+        
+        if subscription:
+            sub_type, sub_value = subscription
+            await db.remove_subscription(sub_id)
+            
+            type_display = {
+                "brand": "бренда",
+                "tyre_size": "типоразмера", 
+                "dealer": "дилера"
+            }.get(sub_type, sub_type)
+            
+            await callback.message.edit_text(f"✅ Вы отписались от {type_display} <b>{sub_value}</b>")
+        else:
+            await callback.message.edit_text("❌ Подписка не найдена")
+    
+    await callback.answer()
+
+# =============================================================================
+# УЛУЧШЕННАЯ СИСТЕМА ОТПРАВКИ УВЕДОМЛЕНИЙ
+# =============================================================================
+
+async def send_notifications_for_new_items(user_id: int, company_name: str, new_items: List[dict]):
+    """Отправляет уведомления о новых товарах одним сообщением"""
+    try:
+        user = await db.fetchone("SELECT telegram_id FROM users WHERE id = ?", (user_id,))
+        if not user:
+            return
+        
+        dealer_telegram_id = user[0]
+        
+        # Собираем все подписки, которые могут быть затронуты
+        all_subscriptions = {}
+        
+        for item in new_items:
+            # Бренды
+            if item['brand']:
+                if 'brand' not in all_subscriptions:
+                    all_subscriptions['brand'] = set()
+                all_subscriptions['brand'].add(item['brand'])
+            
+            # Типоразмеры
+            if item['tyre_size']:
+                if 'tyre_size' not in all_subscriptions:
+                    all_subscriptions['tyre_size'] = set()
+                all_subscriptions['tyre_size'].add(item['tyre_size'])
+        
+        # Добавляем дилера
+        all_subscriptions['dealer'] = {company_name}
+        
+        # Для каждого типа подписки собираем подписчиков и отправляем уведомления
+        notifications_sent = set()  # Чтобы не дублировать уведомления одному пользователю
+        
+        for sub_type, values in all_subscriptions.items():
+            for value in values:
+                subscribers = await db.get_subscribers(sub_type, value)
+                
+                for subscriber_id in subscribers:
+                    # Пропускаем самого дилера (чтобы он не получал уведомления о своих же товарах)
+                    if subscriber_id == dealer_telegram_id:
+                        continue
+                    
+                    if subscriber_id not in notifications_sent:
+                        # Формируем общее уведомление для этого пользователя
+                        notification_text = await format_notification_message(sub_type, value, new_items, company_name)
+                        if notification_text:
+                            try:
+                                await bot.send_message(subscriber_id, notification_text)
+                                notifications_sent.add(subscriber_id)
+                                logger.info(f"Уведомление отправлено пользователю {subscriber_id}")
+                            except Exception as e:
+                                logger.error(f"Ошибка отправки уведомления пользователю {subscriber_id}: {e}")
+        
+        return len(notifications_sent)
+        
+    except Exception as e:
+        logger.error(f"Ошибка в send_notifications_for_new_items: {e}")
+        return 0
+
+async def format_notification_message(sub_type: str, value: str, new_items: List[dict], company_name: str) -> str:
+    """Форматирует сообщение уведомления"""
+    type_display = {
+        "brand": f"🏭 Бренд <b>{value}</b>",
+        "tyre_size": f"📏 Типоразмер <b>{value}</b>", 
+        "dealer": f"🏢 Дилер <b>{value}</b>"
+    }.get(sub_type, f"{sub_type} {value}")
+    
+    # Фильтруем товары по подписке
+    filtered_items = []
+    for item in new_items:
+        if sub_type == "brand" and item['brand'] == value:
+            filtered_items.append(item)
+        elif sub_type == "tyre_size" and item['tyre_size'] == value:
+            filtered_items.append(item)
+        elif sub_type == "dealer" and company_name == value:
+            filtered_items.append(item)
+    
+    if not filtered_items:
+        return ""
+    
+    # Ограничиваем количество товаров в уведомлении
+    display_items = filtered_items[:10]  # Максимум 10 товаров в уведомлении
+    
+    message = f"🔔 <b>Новые товары по вашей подписке</b>\n{type_display}\n\n"
+    
+    for i, item in enumerate(display_items, 1):
+        message += f"{i}. {item['brand']} {item['tyre_size']}"
+        if item.get('tyre_pattern'):
+            message += f" {item['tyre_pattern']}"
+        message += f" - {item['qty_available']} шт.\n"
+    
+    if len(filtered_items) > 10:
+        message += f"\n... и еще {len(filtered_items) - 10} товаров"
+    
+    message += f"\n🏢 <i>Дилер: {company_name}</i>"
+    message += f"\n\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    
+    return message
+
+# =============================================================================
+# ОБРАБОТКА ДОБАВЛЕНИЯ ТОВАРОВ С УВЕДОМЛЕНИЯМИ
+# =============================================================================
+
+@dp.message(F.text == "➕ Добавить товар")
+@dp.message(Command("addstock"))
+async def cmd_addstock(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
+    
+    if not user:
+        await message.answer("Сначала зарегистрируйтесь с помощью /start")
+        return
+    
+    if user[1] != 'Дилер':
+        await message.answer("❌ Только дилеры могут добавлять товары на склад")
+        return
+    
+    stock_count = await db.get_user_stock_count(user[0])
+    if stock_count >= MAX_STOCK_ITEMS:
+        await message.answer(f"❌ Достигнут лимит товаров ({MAX_STOCK_ITEMS}). Удалите часть товаров чтобы добавить новые.")
+        return
+    
+    current_state = await state.get_state()
+    if current_state:
+        await message.answer("⚠️ У вас есть незавершенная операция. Завершите ее или отмените командой /cancel")
+        return
+        
+    await message.answer(
+        "📦 <b>Добавление нового товара</b>\n\n"
+        "Введите артикул (SKU):\n\n"
+        "❌ Для отмены введите /cancel или нажмите кнопку",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AddStock.waiting_for_sku)
+
+@dp.message(AddStock.waiting_for_sku)
+async def process_sku(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    await state.update_data(sku=message.text)
+    await message.answer(
+        "Введите типоразмер шины (например: 195/65 R15):",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AddStock.waiting_for_size)
+
+@dp.message(AddStock.waiting_for_size)
+async def process_size(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    await state.update_data(tyre_size=message.text)
+    await message.answer(
+        "Введите модель шины (tyre pattern):",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AddStock.waiting_for_pattern)
+
+@dp.message(AddStock.waiting_for_pattern)
+async def process_pattern(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    await state.update_data(tyre_pattern=message.text)
+    await message.answer(
+        "Введите бренд шины:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AddStock.waiting_for_brand)
+
+@dp.message(AddStock.waiting_for_brand)
+async def process_brand(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    await state.update_data(brand=message.text)
+    await message.answer(
+        "Введите страну производства:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AddStock.waiting_for_country)
+
+@dp.message(AddStock.waiting_for_country)
+async def process_country(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    await state.update_data(country=message.text)
+    await message.answer(
+        "Введите доступное количество (только цифры):",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AddStock.waiting_for_qty)
+
+@dp.message(AddStock.waiting_for_qty)
+async def process_qty(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    try:
+        # Убираем возможные пробелы и проверяем что это число
+        qty_text = message.text.strip()
+        if not qty_text.isdigit():
+            await message.answer("❌ Количество должно быть числом. Попробуйте снова:")
+            return
+            
+        qty = int(qty_text)
+        if qty <= 0:
+            await message.answer("❌ Количество должно быть положительным числом. Попробуйте снова:")
+            return
+            
+        await state.update_data(qty_available=qty)
+        await message.answer(
+            f"📊 Количество: {qty}\n\nВведите розничную цену (только цифры, можно с точкой):",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.set_state(AddStock.waiting_for_retail_price)
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректное число для количества:")
+
+@dp.message(AddStock.waiting_for_retail_price)
+async def process_retail_price(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    try:
+        # Заменяем запятые на точки и убираем пробелы
+        price_text = message.text.strip().replace(',', '.').replace(' ', '')
+        if not re.match(r'^\d+(\.\d+)?$', price_text):
+            await message.answer("❌ Цена должна быть числом. Попробуйте снова:")
+            return
+            
+        retail_price = float(price_text)
+        if retail_price <= 0:
+            await message.answer("❌ Цена должна быть положительным числом. Попробуйте снова:")
+            return
+            
+        await state.update_data(retail_price=retail_price)
+        await message.answer(
+            f"💰 Розничная цена: {retail_price} руб.\n\nВведите оптовую цену (только цифры, можно с точкой):",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.set_state(AddStock.waiting_for_wholesale_price)
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректное число для цены:")
+
+@dp.message(AddStock.waiting_for_wholesale_price)
+async def process_wholesale_price(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    try:
+        # Заменяем запятые на точки и убираем пробелы
+        price_text = message.text.strip().replace(',', '.').replace(' ', '')
+        if not re.match(r'^\d+(\.\d+)?$', price_text):
+            await message.answer("❌ Цена должна быть числом. Попробуйте снова:")
+            return
+            
+        wholesale_price = float(price_text)
+        if wholesale_price <= 0:
+            await message.answer("❌ Цена должна быть положительным числом. Попробуйте снова:")
+            return
+            
+        await state.update_data(wholesale_price=wholesale_price)
+        await message.answer(
+            f"💼 Оптовая цена: {wholesale_price} руб.\n\nВведите расположение склада:",
+            reply_markup=get_cancel_keyboard()
+        )
+        await state.set_state(AddStock.waiting_for_warehouse)
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректное число для цены:")
+
+@dp.message(AddStock.waiting_for_warehouse)
+async def process_warehouse(message: Message, state: FSMContext):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await cancel_handler(message, state)
+        return
+        
+    await process_warehouse_final(message, state, message.text)
+
+async def process_warehouse_final(message: Message, state: FSMContext, warehouse_location: str):
+    """Финальная обработка добавления товара"""
+    try:
+        user_data = await state.get_data()
+        
+        user = await db.fetchone("SELECT id, company_name FROM users WHERE telegram_id = ?", (message.from_user.id,))
+        
+        if user:
+            user_id, company_name = user[0], user[1]
+            
+            # Добавляем товар в базу
+            await db.execute(
+                """INSERT INTO stock 
+                (user_id, sku, tyre_size, tyre_pattern, brand, country, qty_available, retail_price, wholesale_price, warehouse_location) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, 
+                 user_data['sku'], 
+                 user_data['tyre_size'], 
+                 user_data['tyre_pattern'],
+                 user_data['brand'], 
+                 user_data['country'], 
+                 user_data['qty_available'],
+                 user_data['retail_price'], 
+                 user_data['wholesale_price'], 
+                 warehouse_location)
+            )
+            
+            # Отправляем уведомления подписчикам
+            notification_sent = False
+            
+            # Уведомления по бренду
+            brand_subscribers = await db.get_subscribers("brand", user_data['brand'])
+            if brand_subscribers:
+                notification_text = f"Новый товар бренда {user_data['brand']}: {user_data['tyre_size']} {user_data.get('tyre_pattern', '')}"
+                await send_notifications("brand", user_data['brand'], notification_text)
+                notification_sent = True
+            
+            # Уведомления по типоразмеру
+            size_subscribers = await db.get_subscribers("tyre_size", user_data['tyre_size'])
+            if size_subscribers:
+                notification_text = f"Новый товар размера {user_data['tyre_size']}: {user_data['brand']} {user_data.get('tyre_pattern', '')}"
+                await send_notifications("tyre_size", user_data['tyre_size'], notification_text)
+                notification_sent = True
+            
+            # Уведомления по дилеру
+            dealer_subscribers = await db.get_subscribers("dealer", company_name)
+            if dealer_subscribers:
+                notification_text = f"Новый товар от {company_name}: {user_data['brand']} {user_data['tyre_size']}"
+                await send_notifications("dealer", company_name, notification_text)
+                notification_sent = True
+            
+            success_message = (
+                "✅ Товар успешно добавлен на склад!\n\n"
+                f"🏷️ Артикул: {user_data['sku']}\n"
+                f"📏 Типоразмер: {user_data['tyre_size']}\n"
+                f"🔧 Модель: {user_data.get('tyre_pattern', 'Не указано')}\n"
+                f"🏭 Бренд: {user_data['brand']}\n"
+                f"🌍 Страна: {user_data['country']}\n"
+                f"📊 Количество: {user_data['qty_available']}\n"
+                f"💰 Розничная цена: {user_data['retail_price']} руб.\n"
+                f"💼 Оптовая цена: {user_data['wholesale_price']} руб.\n"
+                f"📍 Склад: {warehouse_location}"
+            )
+            
+            if notification_sent:
+                success_message += "\n\n🔔 Уведомления отправлены подписчикам!"
+            
+            user_role = await get_user_role(message.from_user.id)
+            is_admin_user = is_admin(message.from_user.id)
+            await message.answer(
+                success_message,
+                reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin_user, user_role)
+            )
+        else:
+            await message.answer("❌ Ошибка: пользователь не найден. Используйте /start для регистрации.")
+        
+    except Exception as e:
+        logger.error(f"Add stock error: {e}")
+        await message.answer(f"❌ Произошла ошибка при добавлении товара: {str(e)}")
+    
+    await state.clear()
+
+# =============================================================================
+# АДМИН-ПАНЕЛЬ (ПОЛНАЯ РЕАЛИЗАЦИЯ)
+# =============================================================================
+
+@dp.message(F.text == "🛠️ Админ")
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if await check_rate_limit(message.from_user.id):
+        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
+        return
+        
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    # Статистика системы
+    users_count = await db.fetchone("SELECT COUNT(*) FROM users")
+    stock_count = await db.fetchone("SELECT COUNT(*) FROM stock")
+    dealers_count = await db.fetchone("SELECT COUNT(*) FROM users WHERE role = 'Дилер'")
+    buyers_count = await db.fetchone("SELECT COUNT(*) FROM users WHERE role = 'Покупатель'")
+    
+    admin_text = (
+        "🛠️ <b>Админ-панель Tyreterra</b>\n\n"
+        f"📊 <b>Статистика системы:</b>\n"
+        f"👥 Пользователи: {users_count[0] if users_count else 0}\n"
+        f"📦 Товаров на складах: {stock_count[0] if stock_count else 0}\n"
+        f"🏭 Дилеров: {dealers_count[0] if dealers_count else 0}\n"
+        f"👤 Покупателей: {buyers_count[0] if buyers_count else 0}\n\n"
+        "Выберите действие:"
+    )
+    await message.answer(admin_text, reply_markup=get_admin_keyboard())
+
+@dp.message(F.text == "👥 Пользователи")
+async def cmd_admin_users(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    users = await db.fetchall("""
+        SELECT id, telegram_id, name, company_name, role, created_at 
+        FROM users ORDER BY created_at DESC
+    """)
+    
+    if not users:
+        await message.answer("📭 В системе нет пользователей.")
+        return
+    
+    users_text = "👥 <b>Все пользователи:</b>\n\n"
+    for user in users[:20]:  # Ограничиваем первые 20 пользователей
+        users_text += (
+            f"🆔 ID: {user[0]}\n"
+            f"👤 Имя: {user[2]}\n"
+            f"🏢 Компания: {user[3]}\n"
+            f"🎯 Роль: {user[4]}\n"
+            f"📅 Регистрация: {user[5]}\n"
+            f"────────────────────\n"
+        )
+    
+    if len(users) > 20:
+        users_text += f"\n... и еще {len(users) - 20} пользователей"
+    
+    await message.answer(users_text)
+
+@dp.message(F.text == "📦 Весь склад")
+async def cmd_admin_stock(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    try:
+        stock_items = await db.fetchall("""
+            SELECT s.id, s.sku, s.tyre_size, s.brand, s.qty_available, 
+                   s.retail_price, u.company_name, s.created_at
+            FROM stock s 
+            JOIN users u ON s.user_id = u.id 
+            ORDER BY s.created_at DESC
+            LIMIT 100
+        """)
+        
+        if not stock_items:
+            await message.answer("📭 В системе нет товаров.")
+            return
+        
+        # Создаем Excel файл
+        if not os.path.exists('temp_files'):
+            os.makedirs('temp_files')
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"temp_files/admin_stock_{timestamp}.xlsx"
+        
+        columns = ['ID', 'SKU', 'Типоразмер', 'Бренд', 'Количество', 'Розничная цена', 'Компания', 'Дата добавления']
+        df = pd.DataFrame(stock_items, columns=columns)
+        df.to_excel(filename, index=False, engine='openpyxl')
+        
+        with open(filename, 'rb') as file:
+            await message.answer_document(
+                document=types.BufferedInputFile(
+                    file.read(), 
+                    filename=f"весь_склад_{timestamp}.xlsx"
+                ),
+                caption=f"📦 Весь склад системы ({len(stock_items)} товаров)"
+            )
+            
+    except Exception as e:
+        logger.error(f"Admin stock error: {e}")
+        await message.answer(f"❌ Ошибка при выгрузке склада: {str(e)}")
+
+@dp.message(F.text == "📊 Статистика")
+async def cmd_admin_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    try:
+        # Базовая статистика
+        total_users = await db.fetchone("SELECT COUNT(*) FROM users")
+        total_stock = await db.fetchone("SELECT COUNT(*) FROM stock")
+        total_dealers = await db.fetchone("SELECT COUNT(*) FROM users WHERE role = 'Дилер'")
+        total_buyers = await db.fetchone("SELECT COUNT(*) FROM users WHERE role = 'Покупатель'")
+        
+        # Статистика по брендам
+        brand_stats = await db.fetchall("""
+            SELECT brand, COUNT(*) as count, SUM(qty_available) as total_qty
+            FROM stock 
+            WHERE brand IS NOT NULL AND brand != ''
+            GROUP BY brand 
+            ORDER BY count DESC 
+            LIMIT 10
+        """)
+        
+        # Статистика по размерам
+        size_stats = await db.fetchall("""
+            SELECT tyre_size, COUNT(*) as count
+            FROM stock 
+            WHERE tyre_size IS NOT NULL AND tyre_size != ''
+            GROUP BY tyre_size 
+            ORDER BY count DESC 
+            LIMIT 10
+        """)
+        
+        # Последние регистрации
+        recent_users = await db.fetchall("""
+            SELECT name, company_name, role, created_at 
+            FROM users 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        """)
+        
+        stats_text = (
+            "📊 <b>Статистика системы</b>\n\n"
+            f"👥 <b>Пользователи:</b> {total_users[0] if total_users else 0}\n"
+            f"🏭 Дилеры: {total_dealers[0] if total_dealers else 0}\n"
+            f"👤 Покупатели: {total_buyers[0] if total_buyers else 0}\n"
+            f"📦 <b>Товары:</b> {total_stock[0] if total_stock else 0}\n\n"
+        )
+        
+        if brand_stats:
+            stats_text += "🏭 <b>Топ брендов:</b>\n"
+            for brand, count, total_qty in brand_stats:
+                stats_text += f"• {brand}: {count} позиций, {total_qty} шт.\n"
+            stats_text += "\n"
+        
+        if size_stats:
+            stats_text += "📏 <b>Популярные размеры:</b>\n"
+            for size, count in size_stats:
+                stats_text += f"• {size}: {count} позиций\n"
+            stats_text += "\n"
+        
+        if recent_users:
+            stats_text += "🆕 <b>Последние регистрации:</b>\n"
+            for user in recent_users:
+                stats_text += f"• {user[0]} ({user[1]}) - {user[2]}\n"
+        
+        await message.answer(stats_text)
+        
+    except Exception as e:
+        logger.error(f"Admin stats error: {e}")
+        await message.answer(f"❌ Ошибка при получении статистики: {str(e)}")
+
+@dp.message(F.text == "💾 Экспорт")
+async def cmd_admin_export(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    try:
+        # Экспорт пользователей
+        users = await db.fetchall("""
+            SELECT telegram_id, name, company_name, inn, phone, email, role, created_at
+            FROM users ORDER BY created_at DESC
+        """)
+        
+        # Экспорт товаров
+        stock = await db.fetchall("""
+            SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
+                   s.qty_available, s.retail_price, s.wholesale_price, 
+                   s.warehouse_location, u.company_name, s.created_at
+            FROM stock s 
+            JOIN users u ON s.user_id = u.id 
+            ORDER BY s.created_at DESC
+        """)
+        
+        if not os.path.exists('temp_files'):
+            os.makedirs('temp_files')
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Создаем Excel файл с несколькими листами
+        with pd.ExcelWriter(f"temp_files/full_export_{timestamp}.xlsx", engine='openpyxl') as writer:
+            # Лист пользователей
+            if users:
+                users_columns = ['Telegram ID', 'Имя', 'Компания', 'ИНН', 'Телефон', 'Email', 'Роль', 'Дата регистрации']
+                users_df = pd.DataFrame(users, columns=users_columns)
+                users_df.to_excel(writer, sheet_name='Пользователи', index=False)
+            
+            # Лист товаров
+            if stock:
+                stock_columns = ['SKU', 'Типоразмер', 'Модель', 'Бренд', 'Страна', 'Количество', 
+                               'Розничная цена', 'Оптовая цена', 'Склад', 'Дилер', 'Дата добавления']
+                stock_df = pd.DataFrame(stock, columns=stock_columns)
+                stock_df.to_excel(writer, sheet_name='Товары', index=False)
+        
+        with open(f"temp_files/full_export_{timestamp}.xlsx", 'rb') as file:
+            await message.answer_document(
+                document=types.BufferedInputFile(
+                    file.read(), 
+                    filename=f"полный_экспорт_{timestamp}.xlsx"
+                ),
+                caption=f"💾 Полный экспорт данных\n👥 Пользователей: {len(users) if users else 0}\n📦 Товаров: {len(stock) if stock else 0}"
+            )
+            
+    except Exception as e:
+        logger.error(f"Admin export error: {e}")
+        await message.answer(f"❌ Ошибка при экспорте данных: {str(e)}")
+
+@dp.message(F.text == "🔄 Бэкап")
+async def cmd_admin_backup(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    try:
+        if not os.path.exists('backups'):
+            os.makedirs('backups')
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"backups/tyreterra_backup_{timestamp}.db"
+        
+        # Копируем базу данных
+        shutil.copy2(DB_PATH, backup_filename)
+        
+        # Получаем список бэкапов
+        backups = []
+        if os.path.exists('backups'):
+            for file in os.listdir('backups'):
+                if file.endswith('.db'):
+                    file_path = os.path.join('backups', file)
+                    backups.append((file, os.path.getctime(file_path)))
+        
+        backups.sort(key=lambda x: x[1], reverse=True)
+        
+        backup_text = "✅ Бэкап базы данных создан!\n\n"
+        backup_text += "📂 <b>Последние бэкапы:</b>\n"
+        
+        for i, (backup_file, _) in enumerate(backups[:5], 1):
+            backup_text += f"{i}. {backup_file}\n"
+        
+        if len(backups) > 5:
+            backup_text += f"... и еще {len(backups) - 5} бэкапов\n"
+        
+        backup_text += f"\n💾 Размер базы: {os.path.getsize(DB_PATH) // 1024 // 1024} MB"
+        
+        await message.answer(backup_text)
+        
+    except Exception as e:
+        logger.error(f"Admin backup error: {e}")
+        await message.answer(f"❌ Ошибка при создании бэкапа: {str(e)}")
+
+@dp.message(F.text == "🗃️ SQL")
+async def cmd_admin_sql(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    await message.answer(
+        "🗃️ <b>Выполнение SQL запроса</b>\n\n"
+        "Введите SQL запрос для выполнения:\n"
+        "• SELECT запросы вернут результат\n"
+        "• UPDATE/DELETE запросы будут выполнены\n"
+        "• Будьте осторожны!\n\n"
+        "❌ Для отмены введите /cancel",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AdminPanel.waiting_for_sql_query)
+
+@dp.message(AdminPanel.waiting_for_sql_query)
+async def process_sql_query(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+        
+    if message.text == '/cancel' or message.text == '❌ Отмена':
+        await state.clear()
+        await message.answer("❌ SQL запрос отменен", reply_markup=get_admin_keyboard())
+        return
+    
+    try:
+        sql_query = message.text.strip()
+        
+        # Проверяем на опасные операции
+        dangerous_keywords = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER']
+        is_select = sql_query.upper().startswith('SELECT')
+        
+        if any(keyword in sql_query.upper() for keyword in dangerous_keywords) and not is_select:
+            # Запрос на изменение данных - требуем подтверждение
+            await state.update_data(sql_query=sql_query)
+            await message.answer(
+                f"⚠️ <b>Внимание! Это запрос на изменение данных:</b>\n\n<code>{sql_query}</code>\n\n"
+                "Вы уверены что хотите выполнить этот запрос?",
+                reply_markup=get_confirmation_keyboard()
+            )
+            await state.set_state(AdminPanel.confirmation)
+            return
+        
+        # Выполняем запрос
+        if is_select:
+            # SELECT запрос - возвращаем результат
+            result = await db.fetchall(sql_query)
+            if not result:
+                await message.answer("✅ Запрос выполнен. Результат пуст.")
+            else:
+                result_text = f"✅ Результат ({len(result)} строк):\n\n"
+                for i, row in enumerate(result[:10], 1):  # Ограничиваем первые 10 строк
+                    result_text += f"{i}. {row}\n"
+                
+                if len(result) > 10:
+                    result_text += f"\n... и еще {len(result) - 10} строк"
+                
+                await message.answer(result_text)
+        else:
+            # Другие запросы - просто выполняем
+            await db.execute(sql_query)
+            await message.answer("✅ Запрос выполнен успешно!")
+        
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"SQL query error: {e}")
+        await message.answer(f"❌ Ошибка выполнения SQL запроса: {str(e)}")
+        await state.clear()
+
+@dp.message(AdminPanel.confirmation)
+async def process_sql_confirmation(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+        
+    if message.text == '✅ Да':
+        user_data = await state.get_data()
+        sql_query = user_data['sql_query']
+        
+        try:
+            await db.execute(sql_query)
+            await message.answer("✅ Запрос выполнен успешно!")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка выполнения SQL запроса: {str(e)}")
+    else:
+        await message.answer("❌ Запрос отменен")
+    
+    await state.clear()
+    await message.answer("Выберите действие:", reply_markup=get_admin_keyboard())
+
+@dp.message(F.text == "⚙️ Настройки")
+async def cmd_admin_settings(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    settings_text = (
+        "⚙️ <b>Настройки системы</b>\n\n"
+        f"🔐 Администраторы: {', '.join(map(str, ADMIN_IDS))}\n"
+        f"📦 Макс. товаров на пользователя: {MAX_STOCK_ITEMS}\n"
+        f"📎 Макс. размер файла: {MAX_FILE_SIZE // 1024 // 1024} MB\n"
+        f"💾 Путь к БД: {DB_PATH}\n\n"
+        "Для изменения настроек отредактируйте переменные окружения или конфигурационный файл."
+    )
+    
+    await message.answer(settings_text)
+
+@dp.message(F.text == "🏠 Главное меню")
+async def cmd_admin_back_to_main(message: Message):
+    user_role = await get_user_role(message.from_user.id)
+    is_admin_user = is_admin(message.from_user.id)
+    await message.answer(
+        "Возврат в главное меню",
+        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin_user, user_role)
+    )
+
+# =============================================================================
+# РЕГИСТРАЦИЯ
+# =============================================================================
 
 @dp.message(Registration.waiting_for_role)
 async def process_role(message: Message, state: FSMContext):
@@ -437,12 +1923,13 @@ async def process_inn(message: Message, state: FSMContext):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
         return
         
-    if not validate_inn(message.text):
+    inn = message.text.strip()
+    if not validate_inn(inn):
         await message.answer("❌ Неверный формат ИНН. Введите 10 или 12 цифр:")
         return
     
-    await state.update_data(inn=message.text)
-    await message.answer("Введите ваш контактный телефон (в формате 89991234567):")
+    await state.update_data(inn=inn)
+    await message.answer("Введите ваш номер телефона (в формате 89123456789):")
     await state.set_state(Registration.waiting_for_phone)
 
 @dp.message(Registration.waiting_for_phone)
@@ -451,11 +1938,12 @@ async def process_phone(message: Message, state: FSMContext):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
         return
         
-    if not validate_phone(message.text):
-        await message.answer("❌ Неверный формат телефона. Введите в формате 89991234567:")
+    phone = message.text.strip()
+    if not validate_phone(phone):
+        await message.answer("❌ Неверный формат телефона. Введите номер в формате 89123456789:")
         return
     
-    await state.update_data(phone=message.text)
+    await state.update_data(phone=phone)
     await message.answer("Введите ваш email:")
     await state.set_state(Registration.waiting_for_email)
 
@@ -465,842 +1953,38 @@ async def process_email(message: Message, state: FSMContext):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
         return
         
-    if not validate_email(message.text):
-        await message.answer("❌ Неверный формат email. Введите корректный email:")
+    email = message.text.strip()
+    if not validate_email(email):
+        await message.answer("❌ Неверный формат email. Попробуйте снова:")
         return
     
     user_data = await state.get_data()
     
     try:
         await db.execute(
-            """INSERT INTO users 
-            (telegram_id, name, company_name, inn, phone, email, role) 
+            """INSERT INTO users (telegram_id, name, company_name, inn, phone, email, role) 
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (message.from_user.id, user_data['name'], user_data['company_name'], 
-             user_data['inn'], user_data['phone'], message.text, user_data['role'])
+             user_data['inn'], user_data['phone'], email, user_data['role'])
         )
         
-        role_permissions = ""
-        if user_data['role'] == 'Дилер':
-            role_permissions = "\n✅ Вы можете: загружать склад, скачивать свой склад, просматривать склад других пользователей"
-        else:
-            role_permissions = "\n✅ Вы можете: просматривать склад других пользователей"
-        
         await message.answer(
-            f"🎉 Регистрация завершена!\n\n"
+            f"✅ Регистрация завершена!\n\n"
             f"👤 Имя: {user_data['name']}\n"
             f"🏢 Компания: {user_data['company_name']}\n"
             f"📋 ИНН: {user_data['inn']}\n"
             f"📞 Телефон: {user_data['phone']}\n"
-            f"📧 Email: {message.text}\n"
-            f"🎯 Роль: {user_data['role']}"
-            f"{role_permissions}\n\n"
-            "Используйте команды для работы с системой:",
-            reply_markup=await get_main_keyboard(message.from_user.id)
+            f"📧 Email: {email}\n"
+            f"🎯 Роль: {user_data['role']}\n\n"
+            f"Теперь вы можете пользоваться всеми функциями бота.",
+            reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin(message.from_user.id), user_data['role'])
         )
         
     except Exception as e:
         logger.error(f"Registration error: {e}")
-        await message.answer("❌ Произошла ошибка при регистрации. Попробуйте снова.")
+        await message.answer(f"❌ Ошибка при регистрации: {str(e)}")
     
     await state.clear()
-
-# =============================================================================
-# КОМАНДЫ ДИЛЕРОВ
-# =============================================================================
-
-@dp.message(Command("addstock"))
-async def cmd_addstock(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    if user[1] != 'Дилер':
-        await message.answer("❌ Только дилеры могут добавлять товары на склад")
-        return
-    
-    stock_count = await db.get_user_stock_count(user[0])
-    if stock_count >= MAX_STOCK_ITEMS:
-        await message.answer(f"❌ Достигнут лимит товаров ({MAX_STOCK_ITEMS}). Удалите часть товаров чтобы добавить новые.")
-        return
-    
-    current_state = await state.get_state()
-    if current_state:
-        await message.answer("⚠️ У вас есть незавершенная операция. Завершите ее или отмените командой /cancel")
-        return
-        
-    await message.answer(
-        "Давайте добавим новый товар на склад.\n"
-        "Введите артикул (SKU):\n\n"
-        "❌ Для отмены введите /cancel"
-    )
-    await state.set_state(AddStock.waiting_for_sku)
-
-@dp.message(AddStock.waiting_for_sku)
-async def process_sku(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    await state.update_data(sku=message.text)
-    await message.answer("Введите типоразмер шины (например: 195/65 R15):\n\n❌ Для отмены введите /cancel")
-    await state.set_state(AddStock.waiting_for_size)
-
-@dp.message(AddStock.waiting_for_size)
-async def process_size(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    await state.update_data(tyre_size=message.text)
-    await message.answer("Введите модель шины (tyre pattern):\n\n❌ Для отмены введите /cancel")
-    await state.set_state(AddStock.waiting_for_pattern)
-
-@dp.message(AddStock.waiting_for_pattern)
-async def process_pattern(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    await state.update_data(tyre_pattern=message.text)
-    await message.answer("Введите бренд шины:\n\n❌ Для отмены введите /cancel")
-    await state.set_state(AddStock.waiting_for_brand)
-
-@dp.message(AddStock.waiting_for_brand)
-async def process_brand(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    await state.update_data(brand=message.text)
-    await message.answer("Введите страну производства:\n\n❌ Для отмены введите /cancel")
-    await state.set_state(AddStock.waiting_for_country)
-
-@dp.message(AddStock.waiting_for_country)
-async def process_country(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    await state.update_data(country=message.text)
-    await message.answer("Введите доступное количество (только цифры):\n\n❌ Для отмены введите /cancel")
-    await state.set_state(AddStock.waiting_for_qty)
-
-@dp.message(AddStock.waiting_for_qty)
-async def process_qty(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    try:
-        qty = int(message.text)
-        if qty <= 0:
-            await message.answer("Количество должно быть положительным числом. Попробуйте снова:\n\n❌ Для отмены введите /cancel")
-            return
-        await state.update_data(qty_available=qty)
-        await message.answer("Введите розничную цену (только цифры):\n\n❌ Для отмены введите /cancel")
-        await state.set_state(AddStock.waiting_for_retail_price)
-    except ValueError:
-        await message.answer("Пожалуйста, введите корректное число для количества:\n\n❌ Для отмены введите /cancel")
-
-@dp.message(AddStock.waiting_for_retail_price)
-async def process_retail_price(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    try:
-        retail_price = float(message.text)
-        if retail_price <= 0:
-            await message.answer("Цена должна быть положительным числом. Попробуйте снова:\n\n❌ Для отмены введите /cancel")
-            return
-        await state.update_data(retail_price=retail_price)
-        await message.answer("Введите оптовую цену (только цифры):\n\n❌ Для отмены введите /cancel")
-        await state.set_state(AddStock.waiting_for_wholesale_price)
-    except ValueError:
-        await message.answer("Пожалуйста, введите корректное число для цены:\n\n❌ Для отмены введите /cancel")
-
-@dp.message(AddStock.waiting_for_wholesale_price)
-async def process_wholesale_price(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    try:
-        wholesale_price = float(message.text)
-        if wholesale_price <= 0:
-            await message.answer("Цена должна быть положительным числом. Попробуйте снова:\n\n❌ Для отмены введите /cancel")
-            return
-        await state.update_data(wholesale_price=wholesale_price)
-        await message.answer("Введите расположение склада:\n\n❌ Для отмены введите /cancel")
-        await state.set_state(AddStock.waiting_for_warehouse)
-    except ValueError:
-        await message.answer("Пожалуйста, введите корректное число для цены:\n\n❌ Для отмены введите /cancel")
-
-@dp.message(AddStock.waiting_for_warehouse)
-async def process_warehouse(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    try:
-        user_data = await state.get_data()
-        
-        user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
-        
-        if user:
-            user_id = user[0]
-            
-            await db.execute(
-                """INSERT INTO stock 
-                (user_id, sku, tyre_size, tyre_pattern, brand, country, qty_available, retail_price, wholesale_price, warehouse_location) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, user_data['sku'], user_data['tyre_size'], user_data['tyre_pattern'],
-                 user_data['brand'], user_data['country'], user_data['qty_available'],
-                 user_data['retail_price'], user_data['wholesale_price'], message.text)
-            )
-            
-            await message.answer(
-                "✅ Товар успешно добавлен на склад!\n\n"
-                f"🏷️ Артикул: {user_data['sku']}\n"
-                f"📏 Типоразмер: {user_data['tyre_size']}\n"
-                f"🔧 Модель: {user_data['tyre_pattern']}\n"
-                f"🏭 Бренд: {user_data['brand']}\n"
-                f"🌍 Страна: {user_data['country']}\n"
-                f"📊 Количество: {user_data['qty_available']}\n"
-                f"💰 Розничная цена: {user_data['retail_price']} руб.\n"
-                f"💼 Оптовая цена: {user_data['wholesale_price']} руб.\n"
-                f"📍 Склад: {message.text}",
-                reply_markup=await get_main_keyboard(message.from_user.id)
-            )
-        else:
-            await message.answer("Ошибка: пользователь не найден. Используйте /start для регистрации.")
-        
-    except Exception as e:
-        logger.error(f"Add stock error: {e}")
-        await message.answer(f"❌ Произошла ошибка при добавлении товара: {str(e)}")
-    
-    await state.clear()
-
-@dp.message(Command("mystock"))
-async def cmd_mystock(message: Message):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    try:
-        user = await db.fetchone("SELECT id, name, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-        
-        if not user:
-            await message.answer("Сначала зарегистрируйтесь с помощью /start")
-            return
-        
-        user_id, user_name, role = user[0], user[1], user[2]
-        
-        if role != 'Дилер':
-            await message.answer("❌ Только дилеры могут выгружать свой склад")
-            return
-        
-        cache_key = f"mystock_{user_id}"
-        cached_data = cache.get(cache_key)
-        
-        if cached_data:
-            filename, stock_count = cached_data
-            if os.path.exists(filename):
-                with open(filename, 'rb') as file:
-                    await message.answer_document(
-                        document=types.BufferedInputFile(file.read(), filename=f"мой_склад_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"),
-                        caption=f"📊 Ваш склад ({stock_count} товаров) [КЭШ]\n👤 Пользователь: {user_name}"
-                    )
-                return
-        
-        # ИСПРАВЛЕННЫЙ ЗАПРОС - выбираем ВСЕ 10 столбцов
-        stock_items = await db.fetchall(
-            """SELECT sku, tyre_size, tyre_pattern, brand, country, qty_available, 
-                      retail_price, wholesale_price, warehouse_location, date 
-            FROM stock WHERE user_id = ? ORDER BY date DESC""",
-            (user_id,)
-        )
-        
-        if not stock_items:
-            await message.answer("Ваш склад пуст. Используйте /addstock чтобы добавить товары.")
-            return
-        
-        if not os.path.exists('temp_files'):
-            os.makedirs('temp_files')
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"temp_files/stock_{user_id}_{timestamp}.xlsx"
-        
-        # ИСПРАВЛЕННОЕ СОЗДАНИЕ DATAFRAME
-        columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
-                  'qty_available', 'retail_price', 'wholesale_price', 'warehouse_location', 'date']
-        
-        df = pd.DataFrame(stock_items, columns=columns)
-        df.to_excel(filename, index=False, engine='openpyxl')
-        
-        cache.set(cache_key, (filename, len(stock_items)))
-        
-        with open(filename, 'rb') as file:
-            await message.answer_document(
-                document=types.BufferedInputFile(file.read(), filename=f"мой_склад_{timestamp}.xlsx"),
-                caption=f"📊 Ваш склад ({len(stock_items)} товаров)\n👤 Пользователь: {user_name}"
-            )
-            
-    except Exception as e:
-        logger.error(f"Error in mystock: {e}")
-        await message.answer(f"❌ Ошибка при выгрузке склада: {str(e)}")
-
-@dp.message(Command("deletestock"))
-async def cmd_deletestock(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    user_id, role = user[0], user[1]
-    
-    if role != 'Дилер':
-        await message.answer("❌ Только дилеры могут удалять свой склад")
-        return
-    
-    stock_count = await db.fetchone("SELECT COUNT(*) FROM stock WHERE user_id = ?", (user_id,))
-    
-    if not stock_count or stock_count[0] == 0:
-        await message.answer("❌ Ваш склад уже пуст.")
-        return
-    
-    await message.answer(
-        f"⚠️ ВНИМАНИЕ: Вы собираетесь удалить ВЕСЬ свой склад ({stock_count[0]} товаров).\n"
-        "Это действие НЕЛЬЗЯ отменить!\n\n"
-        "Вы уверены, что хотите продолжить?\n\n"
-        "❌ Для отмены введите /cancel",
-        reply_markup=get_confirmation_keyboard()
-    )
-    await state.set_state(DeleteAllStock.confirmation)
-
-@dp.message(DeleteAllStock.confirmation)
-async def process_delete_all_confirmation(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-    
-    if message.text == 'Да':
-        user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
-        user_id = user[0]
-        
-        await db.execute("DELETE FROM stock WHERE user_id = ?", (user_id,))
-        
-        await message.answer(
-            "✅ Весь ваш склад успешно удален!",
-            reply_markup=await get_main_keyboard(message.from_user.id)
-        )
-    elif message.text == 'Нет':
-        await message.answer(
-            "❌ Удаление склада отменено.",
-            reply_markup=await get_main_keyboard(message.from_user.id)
-        )
-    else:
-        await message.answer("Пожалуйста, выберите 'Да' или 'Нет':")
-        return
-    
-    await state.clear()
-
-@dp.message(Command("deleteitem"))
-async def cmd_deleteitem(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    user_id, role = user[0], user[1]
-    
-    if role != 'Дилер':
-        await message.answer("❌ Только дилеры могут удалять товары")
-        return
-    
-    await message.answer(
-        "Введите SKU товара, который хотите удалить:\n\n"
-        "❌ Для отмены введите /cancel",
-        reply_markup=await get_main_keyboard(message.from_user.id)
-    )
-    await state.set_state(DeleteItem.waiting_for_sku)
-
-@dp.message(DeleteItem.waiting_for_sku)
-async def process_delete_sku(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-    
-    sku = message.text
-    user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    user_id = user[0]
-    
-    item = await db.fetchone(
-        "SELECT * FROM stock WHERE user_id = ? AND sku = ?", 
-        (user_id, sku)
-    )
-    
-    if not item:
-        await message.answer(
-            f"❌ Товар с SKU '{sku}' не найден в вашем складе.\n"
-            "Пожалуйста, проверьте SKU и попробуйте снова:\n\n"
-            "❌ Для отмены введите /cancel"
-        )
-        return
-    
-    await state.update_data(sku=sku)
-    
-    await message.answer(
-        f"Найден товар:\n"
-        f"🏷️ SKU: {item[2]}\n"
-        f"📏 Типоразмер: {item[3]}\n"
-        f"🏭 Бренд: {item[5]}\n"
-        f"📊 Количество: {item[7]}\n\n"
-        f"Вы уверены, что хотите удалить этот товар?\n\n"
-        "❌ Для отмена введите /cancel",
-        reply_markup=get_confirmation_keyboard()
-    )
-    await state.set_state(DeleteItem.confirmation)
-
-@dp.message(DeleteItem.confirmation)
-async def process_delete_confirmation(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-    
-    if message.text == 'Да':
-        user_data = await state.get_data()
-        sku = user_data['sku']
-        
-        user = await db.fetchone("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,))
-        user_id = user[0]
-        
-        await db.execute(
-            "DELETE FROM stock WHERE user_id = ? AND sku = ?", 
-            (user_id, sku)
-        )
-        
-        await message.answer(
-            f"✅ Товар с SKU '{sku}' успешно удален!",
-            reply_markup=await get_main_keyboard(message.from_user.id)
-        )
-    elif message.text == 'Нет':
-        await message.answer(
-            "❌ Удаление товара отменено.",
-            reply_markup=await get_main_keyboard(message.from_user.id)
-        )
-    else:
-        await message.answer("Пожалуйста, выберите 'Да' или 'Нет':")
-        return
-    
-    await state.clear()
-
-# =============================================================================
-# КОМАНДА ПОИСКА (ДЛЯ ВСЕХ)
-# =============================================================================
-
-@dp.message(Command("search"))
-async def cmd_search(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user = await db.fetchone("SELECT role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    await message.answer(
-        "🔍 Поиск товаров\n"
-        "Выберите параметр для поиска:\n\n"
-        "❌ Для отмены введите /cancel",
-        reply_markup=get_search_keyboard()
-    )
-    await state.set_state(SearchStock.waiting_for_search_type)
-
-@dp.message(SearchStock.waiting_for_search_type)
-async def process_search_type(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    search_param = message.text
-    
-    if search_param == 'Все':
-        await state.update_data(search_type='all', search_value='%')
-        await execute_search(message, state)
-        return
-    
-    if search_param not in ['SKU', 'Типоразмер', 'Бренд', 'Склад']:
-        await message.answer("Пожалуйста, выберите параметр из предложенных вариантов:")
-        return
-    
-    param_map = {
-        'SKU': 'sku',
-        'Типоразмер': 'tyre_size', 
-        'Бренд': 'brand',
-        'Склад': 'warehouse_location'
-    }
-    
-    await state.update_data(search_type=param_map[search_param])
-    
-    prompt_text = f"Введите {search_param.lower()} для поиска (или 'все' для всех товаров):\n\n❌ Для отмены введите /cancel"
-    await message.answer(prompt_text, reply_markup=ReplyKeyboardRemove())
-    await state.set_state(SearchStock.waiting_for_search_value)
-
-@dp.message(SearchStock.waiting_for_search_value)
-async def process_search_value(message: Message, state: FSMContext):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if message.text == '/cancel':
-        await cancel_handler(message, state)
-        return
-        
-    search_data = await state.get_data()
-    
-    if message.text.lower() == 'все':
-        search_value = '%'
-    else:
-        search_value = f'%{message.text}%'
-    
-    await state.update_data(search_value=search_value)
-    await execute_search(message, state)
-
-async def execute_search(message: Message, state: FSMContext):
-    try:
-        search_data = await state.get_data()
-        user_role = await get_user_role(message.from_user.id)
-        
-        cache_key = f"search_{search_data.get('search_type', 'all')}_{search_data.get('search_value', 'all')}_{user_role}"
-        cached_data = cache.get(cache_key)
-        
-        if cached_data:
-            filename, stock_count = cached_data
-            if os.path.exists(filename):
-                with open(filename, 'rb') as file:
-                    caption = f"🔍 Результаты поиска ({stock_count} товаров) [КЭШ]"
-                    if user_role == 'Покупатель':
-                        caption += "\n👀 Показаны только розничные цены"
-                    
-                    await message.answer_document(
-                        document=types.BufferedInputFile(file.read(), filename=f"результаты_поиска_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"),
-                        caption=caption
-                    )
-                await state.clear()
-                await message.answer("Поиск завершен.", reply_markup=await get_main_keyboard(message.from_user.id))
-                return
-        
-        if search_data['search_type'] == 'all':
-            query = """SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                              s.qty_available, s.retail_price, s.wholesale_price, 
-                              s.warehouse_location, u.company_name, u.phone, u.email
-                       FROM stock s 
-                       JOIN users u ON s.user_id = u.id 
-                       ORDER BY s.date DESC"""
-            params = ()
-        else:
-            query = f"""SELECT s.sku, s.tyre_size, s.tyre_pattern, s.brand, s.country, 
-                               s.qty_available, s.retail_price, s.wholesale_price, 
-                               s.warehouse_location, u.company_name, u.phone, u.email
-                        FROM stock s 
-                        JOIN users u ON s.user_id = u.id 
-                        WHERE s.{search_data['search_type']} LIKE ?
-                        ORDER BY s.date DESC"""
-            params = (search_data['search_value'],)
-        
-        stock_items = await db.fetchall(query, params)
-        
-        if not stock_items:
-            await message.answer(
-                "❌ По вашему запросу ничего не найдено.",
-                reply_markup=await get_main_keyboard(message.from_user.id)
-            )
-        else:
-            filename = await create_search_excel(stock_items, user_role, search_data.get('search_type', 'search'))
-            
-            if filename:
-                cache.set(cache_key, (filename, len(stock_items)))
-                
-                with open(filename, 'rb') as file:
-                    caption = f"🔍 Результаты поиска ({len(stock_items)} товаров)"
-                    if user_role == 'Покупатель':
-                        caption += "\n👀 Показаны только розничные цены"
-                    
-                    await message.answer_document(
-                        document=types.BufferedInputFile(file.read(), filename=f"результаты_поиска_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
-                        caption=caption
-                    )
-                
-    except Exception as e:
-        logger.error(f"Search error: {e}")
-        await message.answer(f"❌ Ошибка при поиске: {str(e)}")
-    
-    await state.clear()
-    await message.answer("Поиск завершен.", reply_markup=await get_main_keyboard(message.from_user.id))
-
-# =============================================================================
-# АДМИН-ПАНЕЛЬ
-# =============================================================================
-
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Доступ запрещен")
-        return
-    
-    admin_text = (
-        "🛠️ <b>Админ-панель Tyreterra</b>\n\n"
-        "👥 <b>Пользователи:</b>\n"
-        "/admin_users - Просмотр всех пользователей\n"
-        "/admin_edit_user - Редактировать пользователя\n"
-        "/admin_delete_user - Удалить пользователя\n\n"
-        "📦 <b>Склад:</b>\n"
-        "/admin_stock - Просмотр всего склада\n"
-        "/admin_edit_stock - Редактировать запись склада\n"
-        "/admin_delete_stock - Удалить запись склада\n\n"
-        "📊 <b>Аналитика:</b>\n"
-        "/admin_stats - Статистика системы\n"
-        "/admin_export - Полный экспорт данных\n\n"
-        "💾 <b>Утилиты:</b>\n"
-        "/admin_backup - Создать бэкап БД\n"
-        "/admin_sql - Выполнить SQL запрос\n"
-        "/admin_clear_cache - Очистить кэш\n\n"
-        "❌ Для отмены операций используйте /cancel"
-    )
-    await message.answer(admin_text, reply_markup=get_admin_keyboard())
-
-@dp.message(Command("admin_clear_cache"))
-async def cmd_admin_clear_cache(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Доступ запрещен")
-        return
-    
-    try:
-        cache.clear()
-        cleanup_temp_files()
-        await message.answer("✅ Кэш и временные файлы очищены!")
-    except Exception as e:
-        logger.error(f"Clear cache error: {e}")
-        await message.answer(f"❌ Ошибка очистки кэша: {str(e)}")
-
-# =============================================================================
-# ОБРАБОТКА EXCEL ФАЙЛОВ И HELP
-# =============================================================================
-
-@dp.message(F.document)
-async def handle_excel_file(message: Message):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user = await db.fetchone("SELECT id, role FROM users WHERE telegram_id = ?", (message.from_user.id,))
-    
-    if not user:
-        await message.answer("❌ Сначала зарегистрируйтесь с помощью /start")
-        return
-    
-    user_id, role = user[0], user[1]
-    
-    if role != 'Дилер':
-        await message.answer("❌ Только дилеры могут загружать товары через Excel")
-        return
-    
-    if message.document.file_size > MAX_FILE_SIZE:
-        await message.answer(f"❌ Файл слишком большой. Максимальный размер: {MAX_FILE_SIZE // 1024 // 1024}MB")
-        return
-    
-    if message.document.mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 
-                                    'application/vnd.ms-excel']:
-        
-        try:
-            file_id = message.document.file_id
-            file = await bot.get_file(file_id)
-            file_path = file.file_path
-            
-            if not os.path.exists('uploads'):
-                os.makedirs('uploads')
-            
-            download_path = f"uploads/{message.document.file_name}"
-            await bot.download_file(file_path, download_path)
-            
-            df = pd.read_excel(download_path)
-            
-            required_columns = ['sku', 'tyre_size', 'tyre_pattern', 'brand', 'country', 
-                              'qty_available', 'retail_price', 'wholesale_price', 'warehouse_location']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                await message.answer(f"❌ В файле отсутствуют колонки: {', '.join(missing_columns)}")
-                return
-            
-            current_count = await db.get_user_stock_count(user_id)
-            if current_count + len(df) > MAX_STOCK_ITEMS:
-                await message.answer(f"❌ Превышен лимит товаров. Можно добавить еще {MAX_STOCK_ITEMS - current_count} товаров")
-                return
-            
-            added_count = 0
-            
-            for _, row in df.iterrows():
-                try:
-                    await db.execute(
-                        """INSERT INTO stock 
-                        (user_id, sku, tyre_size, tyre_pattern, brand, country, 
-                         qty_available, retail_price, wholesale_price, warehouse_location) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (user_id, str(row['sku']), str(row['tyre_size']), str(row['tyre_pattern']),
-                         str(row['brand']), str(row['country']), int(row['qty_available']),
-                         float(row['retail_price']), float(row['wholesale_price']), str(row['warehouse_location']))
-                    )
-                    added_count += 1
-                except Exception as e:
-                    logger.error(f"Ошибка при добавлении строки: {e}")
-                    continue
-            
-            await message.answer(f"✅ Успешно добавлено {added_count} товаров из Excel файла!")
-            
-        except Exception as e:
-            logger.error(f"Excel processing error: {e}")
-            await message.answer(f"❌ Ошибка при обработке Excel файла: {str(e)}")
-        
-        try:
-            os.remove(download_path)
-        except:
-            pass
-    else:
-        await message.answer("❌ Пожалуйста, отправьте файл в формате Excel (.xlsx)")
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    if await check_rate_limit(message.from_user.id):
-        await message.answer("⚠️ Слишком много запросов. Подождите немного.")
-        return
-        
-    user_role = await get_user_role(message.from_user.id)
-    
-    if is_admin(message.from_user.id):
-        help_text = (
-            "🤖 <b>Tyreterra Bot - Помощь (Админ)</b>\n\n"
-            "👤 <b>Основные команды:</b>\n"
-            "/addstock - Добавить товар на склад\n"
-            "/mystock - Скачать мой склад\n"
-            "/search - Поиск товаров\n"
-            "/deletestock - Удалить весь склад\n"
-            "/deleteitem - Удалить товар по SKU\n\n"
-            "🛠️ <b>Админ-команды:</b>\n"
-            "/admin - Админ-панель\n"
-            "/admin_users - Просмотр пользователей\n"
-            "/admin_stock - Просмотр склада\n"
-            "/admin_stats - Статистика\n"
-            "/admin_export - Экспорт данных\n"
-            "/admin_backup - Бэкап БД\n"
-            "/admin_clear_cache - Очистка кэша\n\n"
-            "❌ Отмена операций: /cancel"
-        )
-    elif user_role == 'Дилер':
-        help_text = (
-            "🤖 <b>Tyreterra Bot - Помощь (Дилер)</b>\n\n"
-            "📦 <b>Управление складом:</b>\n"
-            "/addstock - Добавить товар на склад\n"
-            "/mystock - Скачать мой склад в Excel\n"
-            "/deletestock - Удалить ВЕСЬ склад\n"
-            "/deleteitem - Удалить товар по SKU\n\n"
-            "🔍 <b>Поиск:</b>\n"
-            "/search - Поиск товаров у других пользователей\n"
-            "Показывает все цены (розничные и оптовые)\n\n"
-            "📊 <b>Загрузка данных:</b>\n"
-            "Можно загружать данные из Excel файла\n\n"
-            "❌ <b>Отмена операций:</b>\n"
-            "В любой момент можно отменить операцию командой /cancel"
-        )
-    else:
-        help_text = (
-            "🤖 <b>Tyreterra Bot - Помощь (Покупатель)</b>\n\n"
-            "🔍 <b>Поиск:</b>\n"
-            "/search - Поиск товаров у дилеров\n"
-            "Показываются только розничные цены\n\n"
-            "📞 <b>Контакты:</b>\n"
-            "В результатах поиска вы увидите контакты компаний\n\n"
-            "❌ <b>Отмена операций:</b>\n"
-            "В любой момент можно отменить операцию командой /cancel"
-        )
-    
-    await message.answer(help_text)
 
 @dp.message()
 async def unknown_message(message: Message):
@@ -1308,9 +1992,11 @@ async def unknown_message(message: Message):
         await message.answer("⚠️ Слишком много запросов. Подождите немного.")
         return
         
+    user_role = await get_user_role(message.from_user.id)
+    is_admin_user = is_admin(message.from_user.id)
     await message.answer(
-        "Неизвестная команда. Используйте /help для списка доступных команд.",
-        reply_markup=await get_main_keyboard(message.from_user.id)
+        "Неизвестная команда. Используйте меню для выбора действия.",
+        reply_markup=get_main_menu_keyboard(message.from_user.id, is_admin_user, user_role)
     )
 
 # =============================================================================
